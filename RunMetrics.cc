@@ -6,8 +6,14 @@
 #include "SolGeom.h"
 #include "SolTrack.h"
 
+// Evaluate track resolutions on a (theta, pT) grid:
+//   theta: Nang values uniform in cos(theta) between thmin_deg and 90 deg
+//          (uniform in solid angle; z>0 only, the geometry is symmetric)
+//   pT:    Npt values log-spaced between ptmin and ptmax (GeV)
 void RunMetrics(const char *geoFile = "GeoOPT.txt",
-                const char *outFile = "metrics.root")
+                const char *outFile = "metrics.root",
+                int Nang = 40, double thmin_deg = 10.,
+                int Npt = 20, double ptmin = 0.5, double ptmax = 100.)
 {
     Bool_t Res = kTRUE; // include measurement resolutions
     Bool_t MS  = kTRUE; // include multiple scattering
@@ -15,14 +21,7 @@ void RunMetrics(const char *geoFile = "GeoOPT.txt",
     // Use the CLD version of SolGeom with text geometry
     SolGeom *G = new SolGeom((char*)geoFile);
 
-    // Simple grid: pT in [1, 100] GeV, a few polar angles
-    const int Npt = 15;
-    double ptmin = 1.0;
-    double ptmax = 100.0;
-    double dpt = (ptmax - ptmin) / (Npt - 1);
-
-    const int Nang = 8;
-    double ang_deg[Nang] = {10., 20., 30., 40., 45., 60., 75., 90.};
+    double cmax = TMath::Cos(thmin_deg * TMath::Pi() / 180.0);
 
     // Output file & tree
     TFile *fout = new TFile(outFile, "RECREATE");
@@ -36,11 +35,12 @@ void RunMetrics(const char *geoFile = "GeoOPT.txt",
     t->Branch("sz0_um",    &sz0_um,    "sz0_um/D");    // σ(z0) in μm
 
     for (int ia = 0; ia < Nang; ++ia) {
-        theta_deg = ang_deg[ia];
-        double th = theta_deg * TMath::Pi() / 180.0;
+        double c = (Nang > 1) ? cmax * (1.0 - double(ia) / (Nang - 1)) : 0.0;  // cmax -> 0
+        double th = TMath::ACos(c);
+        theta_deg = th * 180.0 / TMath::Pi();
 
         for (int k = 0; k < Npt; ++k) {
-            pt = ptmin + k * dpt;
+            pt = (Npt > 1) ? ptmin * TMath::Power(ptmax / ptmin, double(k) / (Npt - 1)) : ptmin;
 
             double x[3] = {0.0, 0.0, 0.0};
             double p[3];
@@ -52,8 +52,8 @@ void RunMetrics(const char *geoFile = "GeoOPT.txt",
             tr->CovCalc(Res, MS);
 
             spt_rel = tr->s_pt();             // σ(pT)/pT
-            sd0_um  = tr->s_D()  * 1e3;       // m -> μm
-            sz0_um  = tr->s_z0() * 1e3;       // m -> μm
+            sd0_um  = tr->s_D()  * 1e6;       // m -> μm
+            sz0_um  = tr->s_z0() * 1e6;       // m -> μm
             t->Fill();
             //delete tr;
         }

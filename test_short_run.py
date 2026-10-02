@@ -11,12 +11,12 @@ print('SHORT OPTIMIZATION TEST (5 calls)')
 print('='*60 + '\n')
 
 # Initialize configuration
-optimizer.initialize_optimization_config(n_inner_layers=7, optimize_disks=False)
+optimizer.initialize_optimization_config(n_stations=4, optimize_disks=False)  # the 4 VTX doublets
 
 # Get baseline parameters
-thetas_r = np.array([optimizer.BASE_LAYERS[i]["rPos"] for i in optimizer.FREE_BARREL_IDX])
-thetas_l = np.array([0.5*(optimizer.BASE_LAYERS[i]["xMax"]-optimizer.BASE_LAYERS[i]["xMin"]) for i in optimizer.FREE_BARREL_IDX])
-thetas = np.concatenate([thetas_r, thetas_l])
+thetas = optimizer.baseline_theta()
+thetas_r = thetas[:optimizer.N_FREE_BARREL]
+thetas_l = thetas[optimizer.N_FREE_BARREL:]
 
 # Write baseline and compute initial loss
 optimizer.write_geo_from_theta(thetas)

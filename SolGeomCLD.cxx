@@ -694,7 +694,7 @@ void SolGeom::Draw()
 				char lab[10]; 
 				Int_t stat;
 				stat = sprintf(lab, "fun%d", ig);
-				fn[ig] = new TF1(lab, this, &SolGeom::StereoHyp, lxMin(i), lxMax(i), 3, "SolGeom","StereoHyp");
+				fn[ig] = new TF1(lab, this, &SolGeom::StereoHyp, lxMin(i), lxMax(i), 3);
 				fn[ig]->SetParameter(0, lPos(i));
 				fn[ig]->SetParameter(1, lStU(i));
 				fn[ig]->SetParameter(2, (Double_t) i);

@@ -1,0 +1,15 @@
+.pixi
+.claude/
+__pycache__/
+
+*.root
+*.x
+*.sh
+*.so
+*.d
+*.pcm
+*.c
+*.cmd
+*.exe
+*.txt
+*.lock

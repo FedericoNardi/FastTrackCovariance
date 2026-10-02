@@ -1,4 +1,5 @@
 from pathlib import Path
+import argparse
 import subprocess
 import numpy as np
 import uproot
@@ -6,54 +7,99 @@ import matplotlib.pyplot as plt
 from skopt.space import Real
 from skopt import gp_minimize
 
-ROOT_DIR = Path(__file__).resolve().parent          # "./"
-PKG_DIR  = ROOT_DIR / "FastTrackCovariance"         # "./FastTrackCovariance"
+ROOT_DIR = Path(__file__).resolve().parent          # repo root: ROOT macros are loaded from here
+OPT_DIR  = ROOT_DIR / "opt"
 
-GEO_BASE      = "/homeui/fnardi/mucoll_tracker/FastTrackCovariance/GeoCLD.txt"
-GEO_OPT       = "opt/GeoOPT.txt"
-METRICS_FILE  = "opt/metrics.root"
-RUNMETRICS_C  = "RunMetrics.cc"
-LOADALL_C     = "LoadAll.c"
+GEO_BASE         = ROOT_DIR / "GeoCLD.txt"
+GEO_OPT          = OPT_DIR / "GeoOPT.txt"
+METRICS_FILE     = OPT_DIR / "metrics.root"
+METRICS_BASELINE = OPT_DIR / "metrics_baseline.root"
+RUNMETRICS_C     = "RunMetrics.cc"
+LOADALL_C        = "LoadAll.c"
 
 _cache = {}
+_baseline = None   # baseline resolutions, filled by baseline_metrics()
 
 # ============================================================================
-# GLOBAL CONFIGURATION - Initialized at module load
+# TRACK GRID (passed to RunMetrics.cc)
+# ============================================================================
+N_THETA, THETA_MIN_DEG = 40, 10.0          # uniform in cos(theta) from THETA_MIN_DEG to 90 deg
+N_PT, PT_MIN, PT_MAX   = 20, 0.5, 100.0    # log-spaced, GeV
+
+# ============================================================================
+# GEOMETRY CONSTANTS
+# ============================================================================
+DOUBLET_MAX_GAP = 0.005   # sensors of the same label/length closer than this move as one station (m)
+MIN_GAP         = 0.002   # minimum radial clearance between a station and anything else (m)
+R_FRAC_LO, R_FRAC_HI = 0.70, 1.30   # station radius range relative to baseline
+R_ABS_MAX       = 1.600   # outer envelope for barrel layers (m)
+CLEARANCE       = 0.001   # clearance to the nozzle and to disks (m)
+L_MIN, L_ABS_MAX = 0.050, 2.000     # barrel half-length range (m)
+Z_FRAC_LO, Z_FRAC_HI = 0.70, 1.30   # disk |z| range relative to baseline
+Z_ABS_MAX       = 2.500   # outer envelope for disks (m)
+
+# ============================================================================
+# LOSS CONSTANTS
+# ============================================================================
+FAIL_LOSS = 3.0           # returned for failed evaluations; the baseline scores 1.0
+GP_NOISE  = 1e-6          # the objective is deterministic: fix a tiny noise variance
+
+# ============================================================================
+# GLOBAL CONFIGURATION - Initialized by initialize_optimization_config()
 # ============================================================================
 BASE_LAYERS = []
-FREE_BARREL_IDX = []
-N_FREE_BARREL = 0
-FREE_DISK_IDX = []
-N_FREE_DISK = 0
+STATIONS = []          # all barrel measurement stations, sorted by radius
+FIXED_RADII = []       # barrel layers that never move (beam pipe, support shells)
+FREE_STATIONS = []     # the subset being optimized
+N_FREE_BARREL = 0      # number of free barrel stations
+FREE_BARREL_IDX = []   # layer indices moved by the free stations (sensors + attached supports)
+DISK_STATIONS = []     # all +z disk stations (each mirrored to -z), sorted by z
+FREE_DISK_STATIONS = []
+N_FREE_DISK = 0       # number of free disk stations
 THETA_DIM = 0
+
+def read_metrics(metrics_path):
+    """Read the metrics tree and check it is complete and finite."""
+    with uproot.open(metrics_path) as f:
+        arr = f["metrics"].arrays(library="np")
+    n_expected = N_THETA * N_PT
+    if len(arr["spt_rel"]) != n_expected:
+        raise RuntimeError(f"{metrics_path} has {len(arr['spt_rel'])} entries, expected {n_expected}")
+    for k in ("spt_rel", "sd0_um"):
+        if not np.all(np.isfinite(arr[k])) or np.any(arr[k] <= 0):
+            raise RuntimeError(f"{metrics_path} contains non-finite or non-positive {k}")
+    return arr
+
+def baseline_metrics():
+    """Resolutions of the base geometry on the same track grid (computed once)."""
+    global _baseline
+    if _baseline is None:
+        run_root_metrics(GEO_BASE, METRICS_BASELINE)
+        _baseline = read_metrics(METRICS_BASELINE)
+    return _baseline
 
 def compute_loss_from_metrics(metrics_path=METRICS_FILE):
     """
-    Compute tracking performance loss from ROOT metrics file.
+    Compute tracking performance loss from ROOT metrics file, relative to the
+    baseline geometry evaluated on the same tracks.
 
-    Returns a weighted combination of:
-      - Relative pT resolution: σ(pT)/pT
-      - Impact parameter resolution: σ(d0) in mm
+    Each track's σ(pT)/pT and σ(d0) is divided by the baseline value for that
+    track, so every (θ, pT) point counts equally and both resolutions are
+    dimensionless. Returns the average of the mean pT and d0 ratios: the
+    baseline scores exactly 1.0, a uniform 10% improvement scores 0.9.
 
     Lower is better.
     """
-    with uproot.open(metrics_path) as f:
-        tree = f["metrics"]
-        arr = tree.arrays(library="np")
+    arr = read_metrics(metrics_path)
+    base = baseline_metrics()
+    if not (np.allclose(arr["pt"], base["pt"]) and np.allclose(arr["theta_deg"], base["theta_deg"])):
+        raise RuntimeError("track grid differs from the baseline metrics")
 
-    spt_rel = arr["spt_rel"]    # σ(pT)/pT (dimensionless)
-    sd0_um  = arr["sd0_um"]     # σ(d0) in micrometers
+    r_pT = float(np.mean(arr["spt_rel"] / base["spt_rel"]))
+    r_d0 = float(np.mean(arr["sd0_um"] / base["sd0_um"]))
 
-    # Use mean tracking resolution
-    L_pT = float(np.mean(spt_rel))
-    L_d0 = float(np.mean(sd0_um) / 1000.0)  # convert μm to mm
-
-    # Balanced weighting: both metrics matter
-    # Typical values: L_pT ~ 0.01-0.1, L_d0 ~ 0.001-0.01 mm
-    alpha, beta = 1.0, 1.0
-    loss = alpha * L_pT + beta * L_d0
-
-    return loss
+    alpha, beta = 0.5, 0.5
+    return alpha * r_pT + beta * r_d0
 
 def nozzle_profile(x):
     m1 = 0.1763
@@ -61,68 +107,99 @@ def nozzle_profile(x):
     q2 = 9.156*0.01 # meters
     return np.where(x<1., m1*x, m2*x+q2)
 
-def barrel_nozzle_penalty(theta, clearance=0.0, scale=0.01):
+def nozzle_inverse(r):
+    """Largest |z| at which the nozzle radius is still below r (inverse of nozzle_profile)."""
+    m1 = 0.1763
+    m2 = 0.08474
+    q2 = 9.156*0.01 # meters
+    if r <= 0.0:
+        return 0.0
+    return r / m1 if r < m1 else (r - q2) / m2
+
+def barrel_nozzle_penalty(theta, clearance=CLEARANCE, scale=0.01):
     """
     Compute penalty for barrel layers that violate nozzle clearance.
 
-    Only checks the free barrel layers being optimized, not fixed layers
-    like the beam pipe which have different constraints.
+    Only checks the barrel layers moved by the optimizer (sensors and their
+    attached supports), not fixed layers like the beam pipe which have
+    different constraints. Zero by construction for lengths built by
+    build_layers_from_theta; kept as a safety check.
     """
     layers = build_layers_from_theta(theta)
     penalty = 0.0
 
-    # Only check the free barrel layers being optimized
     for idx in FREE_BARREL_IDX:
         L = layers[idx]
-        if L["tyLay"] != 1:
-            continue
-
         R_b   = L["rPos"]
         z_end = max(abs(L["xMin"]), abs(L["xMax"]))  # half-length
         r_noz = float(nozzle_profile(z_end)) + clearance
         v = r_noz - R_b
 
-        if v > 0.0:
+        if v > 1e-9:
             penalty += (v / scale) ** 2
 
     return penalty
 
-def barrel_disk_overlap_penalty(theta, clearance=0.001, scale=0.01):
+def barrel_disk_overlap_penalty(theta, clearance=CLEARANCE, scale=0.01):
     """
-    Compute penalty for barrel layers that overlap with disk layers.
+    Compute penalty for moved barrel layers that intersect any disk layer.
 
-    Checks all barrel-disk pairs and penalizes any violation of the clearance.
+    A barrel (radius R_b, half-length L_b) and a disk (plane z_d, radii
+    [r_min, r_max]) overlap when |z_d| < L_b and r_min < R_b < r_max, each
+    widened by the clearance. The violation is the smallest displacement that
+    resolves it: shortening the barrel or moving it radially off the disk.
+    Fixed disks are included, since free barrels can grow into them.
+    Zero by construction for lengths built by build_layers_from_theta; kept
+    as a safety check.
     """
     layers = build_layers_from_theta(theta)
     penalty = 0.0
 
-    # Get free barrel and disk layers
-    barrel_layers = [layers[i] for i in FREE_BARREL_IDX if layers[i]["tyLay"] == 1]
-    disk_layers   = [layers[i] for i in FREE_DISK_IDX if layers[i]["tyLay"] == 2]
+    disks = [L for L in layers if L["tyLay"] == 2]
 
-    for b in barrel_layers:
+    for idx in FREE_BARREL_IDX:
+        b = layers[idx]
         R_b = b["rPos"]
-        z_b_min = b["xMin"]
-        z_b_max = b["xMax"]
+        L_b = max(abs(b["xMin"]), abs(b["xMax"]))
 
-        for d in disk_layers:
-            z_d = d["rPos"]
-
-            # Check if disk plane intersects barrel half-length
-            if z_b_min - clearance < z_d < z_b_max + clearance:
-                # Check radial overlap
-                r_noz = float(nozzle_profile(abs(z_d))) + clearance
-                v = r_noz - R_b
-                if v > 0.0:
-                    penalty += (v / scale) ** 2
+        for d in disks:
+            axial  = (L_b + clearance) - abs(d["rPos"])
+            radial = min(R_b - (d["xMin"] - clearance), (d["xMax"] + clearance) - R_b)
+            if axial > 1e-9 and radial > 0.0:
+                v = min(axial, radial)
+                penalty += (v / scale) ** 2
 
     return penalty
+
+def station_length_max(station, R, layers, clearance=CLEARANCE):
+    """
+    Longest half-length a station at reference radius R can have without
+    entering the nozzle or crossing any disk in `layers`.
+
+    The nozzle radius grows with |z|, so the innermost member is the binding
+    one. A disk limits the length if any member's radius falls inside its
+    radial extent (widened by the clearance), matching the overlap penalty.
+    """
+    radii = [R + dr for _, dr in station["members"]]
+    L_max = min(L_ABS_MAX, nozzle_inverse(min(radii) - clearance))
+    for d in layers:
+        if d["tyLay"] != 2:
+            continue
+        if any(d["xMin"] - clearance < r < d["xMax"] + clearance for r in radii):
+            L_max = min(L_max, abs(d["rPos"]) - clearance)
+    return L_max
+
+def length_from_fraction(f, L_max):
+    """Map f in [0, 1] onto [L_MIN, L_max]."""
+    return L_MIN + f * max(L_max - L_MIN, 0.0)
 
 def score(theta):
     """
     Objective function for Bayesian optimization.
-    theta: [R_1, ..., R_N, L_1, ..., L_N, Z_1, ..., Z_M]
-    Returns: scalar loss value (lower is better)
+    theta: [R_1, ..., R_N, f_1, ..., f_N, Z_1, ..., Z_M]
+           R is the reference radius of each free station, f its half-length
+           as a fraction of the longest allowed one (see station_length_max).
+    Returns: scalar loss value (lower is better, baseline = 1.0)
     """
     theta = np.asarray(theta, dtype=float)
     expected_len = 2 * N_FREE_BARREL + N_FREE_DISK
@@ -138,25 +215,24 @@ def score(theta):
     Nb = N_FREE_BARREL
     Nd = N_FREE_DISK
     R_b = theta[0:Nb]
-    L_b = theta[Nb:2*Nb]
+    f_b = theta[Nb:2*Nb]
     Z_d = theta[2*Nb:2*Nb + Nd] if Nd > 0 else np.array([])
 
     # --- basic bounds (should be enforced by optimizer, but double-check) ---
     # Absolute physical limits
     R_abs_min, R_abs_max = 0.020, 2.000  # absolute barrel radius limits
-    L_abs_min, L_abs_max = 0.050, 2.500  # absolute half-length limits
     Z_abs_min, Z_abs_max = 0.01, 2.5     # disk z-range
 
     if (np.any(R_b < R_abs_min) or np.any(R_b > R_abs_max) or
-        np.any(L_b < L_abs_min) or np.any(L_b > L_abs_max)):
-        print(f"[OUT OF BOUNDS] R={R_b}, L={L_b}")
-        _cache[key] = 1e6
-        return 1e6
+        np.any(f_b < 0.0) or np.any(f_b > 1.0)):
+        print(f"[OUT OF BOUNDS] R={R_b}, f={f_b}")
+        _cache[key] = FAIL_LOSS
+        return FAIL_LOSS
 
     if Nd > 0 and (np.any(Z_d < Z_abs_min) or np.any(Z_d > Z_abs_max)):
         print(f"[OUT OF BOUNDS] Z={Z_d}")
-        _cache[key] = 1e6
-        return 1e6
+        _cache[key] = FAIL_LOSS
+        return FAIL_LOSS
 
     # --- base tracking loss ---
     try:
@@ -165,53 +241,110 @@ def score(theta):
         base_loss = compute_loss_from_metrics(METRICS_FILE)
     except Exception as e:
         print(f"[ERROR] Failed to compute metrics: {e}")
-        _cache[key] = 1e6
-        return 1e6
+        _cache[key] = FAIL_LOSS
+        return FAIL_LOSS
 
-    # --- nozzle area forbidden ---
-    nozzle_penalty = barrel_nozzle_penalty(theta, clearance=0.001, scale=0.01)
-    
-    # --- disk-barrel overlap forbidden ---
-    overlap_penalty = barrel_disk_overlap_penalty(theta, clearance=0.001, scale=0.01)
+    # --- nozzle area forbidden (zero by construction) ---
+    nozzle_penalty = barrel_nozzle_penalty(theta)
 
-    # Weighted loss: focus primarily on tracking performance
-    loss = 5.* base_loss + 2.0 * nozzle_penalty + 2.0 * overlap_penalty
+    # --- disk-barrel overlap forbidden (zero by construction) ---
+    overlap_penalty = barrel_disk_overlap_penalty(theta)
 
+    loss = base_loss + nozzle_penalty + overlap_penalty
+
+    layers = build_layers_from_theta(theta)
+    L_b = [layers[s["sensors"][0]]["xMax"] for s in FREE_STATIONS]
     print(
         f"R_b={[f'{r:.4f}' for r in R_b]}, L_b={[f'{l:.4f}' for l in L_b]} -> "
-        f"base={base_loss:.4g}, nozzle={nozzle_penalty:.4g}, total={loss:.4g}"
+        f"base={base_loss:.4f}, nozzle={nozzle_penalty:.4g}, "
+        f"overlap={overlap_penalty:.4g}, total={loss:.4f}"
     )
 
     _cache[key] = loss
     return loss
 
 def run_root_metrics(geo_file=GEO_OPT, metrics_file=METRICS_FILE):
+    """
+    Run RunMetrics.cc on geo_file. The output file is removed first so a failed
+    run can never leave the previous geometry's metrics behind to be read.
+    """
+    metrics_file = Path(metrics_file)
+    metrics_file.parent.mkdir(parents=True, exist_ok=True)
+    metrics_file.unlink(missing_ok=True)
+
     cmd = [
         "root",
         "-b",
         "-q",
-        f'{str(LOADALL_C)}("CLD")',         # compile library
-        f'{str(RUNMETRICS_C)}+("{geo_file}", "{metrics_file}")',
+        f'{LOADALL_C}("CLD")',         # compile library
+        f'{RUNMETRICS_C}+("{geo_file}", "{metrics_file}", '
+        f'{N_THETA}, {THETA_MIN_DEG}, {N_PT}, {PT_MIN}, {PT_MAX})',
     ]
     print("Running ROOT:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, cwd=ROOT_DIR)
 
-def draw_from_file(geom_file=GEO_OPT):
-    # Read geometry file and draws layers accordingly
-    with open(geom_file, 'r') as f:
-        lines = f.readlines()
-    layers = []
-    for line in lines:
-        parts = line.strip().split()
-        layers.append([float(parts[0]),float(parts[2]),float(parts[3]),float(parts[4])])
-    plt.figure(figsize=(15,10))
-    for layer in layers:
-        if layer[0]==1: # Barrel
-            plt.plot([layer[1], layer[2]], [layer[3], layer[3]], color='blue')
-        if layer[0]==2:
-            plt.plot([layer[3], layer[3]], [layer[1], layer[2]], color='red')
-    plt.xlim(-2.5,2.5)
-    plt.savefig('opt/geometry.png')
+    if not metrics_file.exists():
+        raise RuntimeError(f"ROOT exited cleanly but did not write {metrics_file}")
+
+def draw_from_file(geom_file=GEO_OPT, out_file=None, title=None):
+    """
+    Draw the (z, r) layout of a geometry file.
+
+    Active (measurement) layers are solid and coloured: barrels blue, disks
+    red. Passive layers (supports, beam pipe) are grey and dashed; their line
+    width grows with their material budget. The nozzle region is shaded.
+    """
+    layers = load_layers(geom_file)
+    out_file = Path(out_file) if out_file else OPT_DIR / "geometry.png"
+    z_lim, r_lim = 2.6, 1.7
+
+    fig, (ax, axin) = plt.subplots(1, 2, figsize=(18, 8), gridspec_kw={"width_ratios": [3, 1]})
+
+    def draw(ax, z_max):
+        # Nozzle (forbidden region)
+        z = np.linspace(0.0, z_max, 200)
+        for sign in (-1, 1):
+            ax.fill_between(sign * z, 0.0, nozzle_profile(z), color="0.85", lw=0)
+        for L in layers:
+            active = L["flLay"] == 1
+            x0 = L["thLay"] / L["rlLay"] if L["rlLay"] > 0 else 0.0   # fraction of X0
+            if active:
+                color, ls, lw = ("tab:blue" if L["tyLay"] == 1 else "tab:red"), "-", 1.8
+            else:
+                color, ls, lw = "0.35", "--", 0.8 + 150.0 * x0   # ~1.6 for 0.5% X0
+            if L["tyLay"] == 1:   # barrel: z from xMin to xMax at r = rPos
+                zmin, zmax = max(L["xMin"], -z_max), min(L["xMax"], z_max)
+                ax.plot([zmin, zmax], [L["rPos"], L["rPos"]], color=color, ls=ls, lw=lw)
+            else:                 # disk: r from xMin to xMax at z = rPos
+                ax.plot([L["rPos"], L["rPos"]], [L["xMin"], L["xMax"]], color=color, ls=ls, lw=lw)
+
+    draw(ax, z_lim)
+
+    # Zoom on the vertex region (side panel)
+    zi, ri = 0.35, 0.18
+    draw(axin, zi)
+    axin.set_xlim(-zi, zi)
+    axin.set_ylim(0.0, ri)
+    axin.set_xlabel("z [m]")
+    axin.set_title("vertex region")
+    ax.add_patch(plt.Rectangle((-zi, 0.0), 2 * zi, ri, fill=False, ec="0.4", lw=0.8))
+
+    from matplotlib.lines import Line2D
+    handles = [
+        Line2D([], [], color="tab:blue", lw=1.8, label="active barrel"),
+        Line2D([], [], color="tab:red", lw=1.8, label="active disk"),
+        Line2D([], [], color="0.35", ls="--", lw=1.2, label="passive (width ~ X/X0)"),
+        plt.Rectangle((0, 0), 1, 1, color="0.85", label="nozzle"),
+    ]
+    ax.legend(handles=handles, loc="upper right", framealpha=0.9)
+    ax.set_xlim(-z_lim, z_lim)
+    ax.set_ylim(0.0, r_lim)
+    ax.set_xlabel("z [m]")
+    ax.set_ylabel("r [m]")
+    ax.set_title(title or Path(geom_file).name)
+    fig.tight_layout()
+    fig.savefig(out_file, dpi=120)
+    plt.close(fig)
 
 def load_layers(geo_path=GEO_BASE):
     """Read GeoCLD.txt into a list of layer dicts."""
@@ -241,10 +374,191 @@ def load_layers(geo_path=GEO_BASE):
             layers.append(layer)
     return layers
 
+def build_stations(layers):
+    """
+    Group barrel layers into rigid stations.
+
+    A station is one barrel measurement layer, or a doublet of measurement
+    layers with the same label and length closer than DOUBLET_MAX_GAP. Each
+    passive barrel layer (flLay=0, not the beam pipe) is attached to the
+    nearest station with the same label and the same half-length, i.e. the
+    support it belongs to. Passive layers with no such station (support shells,
+    tubes) stay fixed.
+
+    Returns (stations, fixed_radii): stations sorted by radius, each with
+    'R0' (reference radius = innermost sensor), 'L0', 'sensors' and
+    'members' as (layer index, radial offset from R0); fixed_radii are radii of
+    the barrel layers that never move (beam pipe and unattached passives).
+    """
+    def half_length(L):
+        return 0.5 * (L["xMax"] - L["xMin"])
+
+    sensors = sorted(
+        (i for i, L in enumerate(layers) if L["tyLay"] == 1 and L["flLay"] == 1),
+        key=lambda i: layers[i]["rPos"],
+    )
+
+    stations = []
+    for i in sensors:
+        L = layers[i]
+        if stations:
+            prev = layers[stations[-1]["sensors"][-1]]
+            if (L["label"] == prev["label"]
+                    and np.isclose(half_length(L), half_length(prev))
+                    and L["rPos"] - prev["rPos"] <= DOUBLET_MAX_GAP):
+                stations[-1]["sensors"].append(i)
+                continue
+        stations.append({"label": L["label"], "R0": L["rPos"], "L0": half_length(L), "sensors": [i]})
+
+    for s in stations:
+        s["members"] = [(i, layers[i]["rPos"] - s["R0"]) for i in s["sensors"]]
+
+    fixed_radii = []
+    for i, L in enumerate(layers):
+        if L["tyLay"] != 1 or L["flLay"] == 1:
+            continue
+        candidates = [s for s in stations
+                      if L["label"] != "PIPE" and s["label"] == L["label"]
+                      and np.isclose(s["L0"], half_length(L))]
+        if candidates:
+            s = min(candidates, key=lambda s: abs(L["rPos"] - s["R0"]))
+            s["members"].append((i, L["rPos"] - s["R0"]))
+        else:
+            fixed_radii.append(L["rPos"])
+
+    for s in stations:
+        offsets = [dr for _, dr in s["members"]]
+        s["dr_min"], s["dr_max"] = min(offsets), max(offsets)
+
+    return stations, sorted(fixed_radii)
+
+def build_disk_stations(layers):
+    """
+    Group disk layers into rigid, mirror-symmetric stations.
+
+    Each +z measurement disk is a station. Each passive +z disk is attached to
+    the nearest station with the same label and radial extent (its support).
+    Every member has a -z mirror (same label and radii, z -> -z) that moves
+    with it, so only +z positions are optimized.
+
+    Returns stations sorted by z, each with 'Z0' (sensor z), 'rmin'/'rmax'
+    (radial extent of the members) and 'members' as
+    (layer index, mirror layer index, z offset from Z0).
+    """
+    def same_disk(a, b):
+        return (a["label"] == b["label"] and np.isclose(a["xMin"], b["xMin"])
+                and np.isclose(a["xMax"], b["xMax"]))
+
+    def mirror_of(i):
+        for j, L in enumerate(layers):
+            if (L["tyLay"] == 2 and L["flLay"] == layers[i]["flLay"]
+                    and same_disk(L, layers[i]) and np.isclose(L["rPos"], -layers[i]["rPos"])):
+                return j
+        raise ValueError(f"disk layer {i} ({layers[i]['label']} at z={layers[i]['rPos']}) has no -z mirror")
+
+    pos = [i for i, L in enumerate(layers) if L["tyLay"] == 2 and L["rPos"] > 0]
+    stations = [
+        {"label": layers[i]["label"], "Z0": layers[i]["rPos"],
+         "rmin": layers[i]["xMin"], "rmax": layers[i]["xMax"],
+         "members": [(i, mirror_of(i), 0.0)]}
+        for i in sorted((i for i in pos if layers[i]["flLay"] == 1), key=lambda i: layers[i]["rPos"])
+    ]
+    for i in pos:
+        if layers[i]["flLay"] == 1:
+            continue
+        candidates = [s for s in stations if same_disk(layers[s["members"][0][0]], layers[i])]
+        if not candidates:
+            raise ValueError(f"passive disk {i} ({layers[i]['label']} at z={layers[i]['rPos']}) has no matching sensor disk")
+        s = min(candidates, key=lambda s: abs(layers[i]["rPos"] - s["Z0"]))
+        s["members"].append((i, mirror_of(i), layers[i]["rPos"] - s["Z0"]))
+
+    for s in stations:
+        offsets = [dz for _, _, dz in s["members"]]
+        s["dz_min"], s["dz_max"] = min(offsets), max(offsets)
+    return stations
+
+def disk_z_bounds(stations, gap=MIN_GAP):
+    """
+    |z| bounds for each disk station such that disks cannot cross.
+
+    Two stations only constrain each other when their radial extents overlap
+    (e.g. ITK and OTK disks can share a z). Neighbouring overlapping stations
+    split the space at the baseline midpoint with `gap` clearance, as for the
+    barrel radii. A station also stays far enough out that barrels at its
+    radius can keep their minimum length. Bounds are additionally limited to
+    [Z_FRAC_LO, Z_FRAC_HI] x baseline and Z_ABS_MAX.
+    """
+    bounds = []
+    for k, s in enumerate(stations):
+        lo_k, hi_k = s["Z0"] + s["dz_min"], s["Z0"] + s["dz_max"]
+        lo = max(Z_FRAC_LO * s["Z0"], L_MIN + CLEARANCE - s["dz_min"])
+        hi = min(Z_FRAC_HI * s["Z0"], Z_ABS_MAX - s["dz_max"])
+        for n in stations:
+            if n is s or not (n["rmin"] - gap < s["rmax"] and s["rmin"] < n["rmax"] + gap):
+                continue
+            lo_n, hi_n = n["Z0"] + n["dz_min"], n["Z0"] + n["dz_max"]
+            if hi_n <= lo_k:      # n is below s
+                lo = max(lo, 0.5 * (hi_n + lo_k) + 0.5 * gap - s["dz_min"])
+            elif lo_n >= hi_k:    # n is above s
+                hi = min(hi, 0.5 * (hi_k + lo_n) - 0.5 * gap - s["dz_max"])
+        if not lo < hi:
+            raise ValueError(f"Disk station {k} ({s['label']} at z={s['Z0']:.4f}) has empty z range [{lo:.4f}, {hi:.4f}]")
+        if not lo <= s["Z0"] <= hi:
+            print(f"[WARNING] baseline z={s['Z0']:.4f} of disk station {k} outside its bounds [{lo:.4f}, {hi:.4f}]")
+        bounds.append((lo, hi))
+    return bounds
+
+def disk_rmin(rmin0, z0, z):
+    """
+    Inner radius of a disk moved from |z0| to |z|: keeps the baseline margin to
+    the nozzle when moving outwards and never shrinks below the baseline.
+    """
+    return max(rmin0, rmin0 + float(nozzle_profile(abs(z))) - float(nozzle_profile(abs(z0))))
+
+def station_radius_bounds(stations, free, fixed_radii, gap=MIN_GAP):
+    """
+    Radius bounds for each free station such that no two layers can cross.
+
+    Every station keeps at least `gap` from fixed layers (beam pipe, support
+    shells) and from stations that are not optimized. Two neighbouring free
+    stations split the space between them at the baseline midpoint, so any
+    point in the box is a valid ordering with at least `gap` clearance.
+    Bounds are additionally limited to [R_FRAC_LO, R_FRAC_HI] x baseline.
+    """
+    # Everything a free station can bump into, as (inner, outer, is_free_station)
+    items = [(r, r, False) for r in fixed_radii]
+    for k, s in enumerate(stations):
+        items.append((s["R0"] + s["dr_min"], s["R0"] + s["dr_max"], k in free))
+    items.sort()
+
+    bounds = []
+    for k in free:
+        s = stations[k]
+        inner, outer = s["R0"] + s["dr_min"], s["R0"] + s["dr_max"]
+        pos = items.index((inner, outer, True))
+
+        lo = R_FRAC_LO * s["R0"]
+        if pos > 0:
+            p_in, p_out, p_free = items[pos - 1]
+            edge = 0.5 * (p_out + inner) + 0.5 * gap if p_free else p_out + gap
+            lo = max(lo, edge - s["dr_min"])
+
+        hi = min(R_FRAC_HI * s["R0"], R_ABS_MAX - s["dr_max"])
+        if pos < len(items) - 1:
+            n_in, n_out, n_free = items[pos + 1]
+            edge = 0.5 * (outer + n_in) - 0.5 * gap if n_free else n_in - gap
+            hi = min(hi, edge - s["dr_max"])
+
+        if not lo < hi:
+            raise ValueError(f"Station {k} ({s['label']} at R={s['R0']:.4f}) has empty radius range [{lo:.4f}, {hi:.4f}]")
+        if not lo <= s["R0"] <= hi:
+            print(f"[WARNING] baseline R={s['R0']:.4f} of station {k} outside its bounds [{lo:.4f}, {hi:.4f}]")
+        bounds.append((lo, hi))
+    return bounds
+
 def write_geo_from_theta(theta, out_path=GEO_OPT):
     """
-    theta: array-like of length N_FREE, radii (m) for each free layer
-           in the order of FREE_IDX.
+    theta: [R_1..R_N, f_1..f_N, Z_1..Z_M] for the free stations and disks.
     """
     theta = np.asarray(theta, dtype=float)
     if theta.shape[0] != THETA_DIM:
@@ -253,6 +567,7 @@ def write_geo_from_theta(theta, out_path=GEO_OPT):
     layers = build_layers_from_theta(theta)
 
     # write full geometry to file
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         for L in layers:
             f.write(
@@ -263,194 +578,224 @@ def write_geo_from_theta(theta, out_path=GEO_OPT):
                 f"{L['sgLayU']:.6g} {L['sgLayL']:.6g} {L['flLay']:d}\n"
             )
 
+def baseline_theta():
+    """Parameter vector reproducing the base geometry."""
+    thetas_r = [s["R0"] for s in FREE_STATIONS]
+    thetas_f = []
+    for s in FREE_STATIONS:
+        L_max = station_length_max(s, s["R0"], BASE_LAYERS)
+        if s["L0"] > L_max + 1e-9:
+            print(f"[WARNING] baseline {s['label']} station at R={s['R0']:.4f} has L={s['L0']:.4f} > allowed {L_max:.4f}")
+        span = L_max - L_MIN
+        thetas_f.append(float(np.clip((s["L0"] - L_MIN) / span, 0.0, 1.0)) if span > 0 else 0.0)
+    thetas_z = [s["Z0"] for s in FREE_DISK_STATIONS]
+    return np.array(thetas_r + thetas_f + thetas_z, dtype=float)
+
 def run_bayes_optimization(n_calls=50, n_initial_points=20):
     """
     Run Bayesian optimization to find best layer configuration.
 
+    The baseline geometry is evaluated and passed to the optimizer as a
+    starting point, so the reported optimum can never be worse than it.
+
     Args:
-        n_calls: Total number of optimization iterations
+        n_calls: Total number of optimization iterations (baseline excluded)
         n_initial_points: Number of random initialization points
     """
     print(f"\n{'='*60}")
     print(f"Starting Bayesian Optimization")
-    print(f"  Free barrel layers: {N_FREE_BARREL}")
-    print(f"  Free disk layers:   {N_FREE_DISK}")
-    print(f"  Total parameters:   {THETA_DIM}")
-    print(f"  Optimization calls: {n_calls}")
+    print(f"  Free barrel stations: {N_FREE_BARREL}")
+    print(f"  Free disk layers:     {N_FREE_DISK}")
+    print(f"  Total parameters:     {THETA_DIM}")
+    print(f"  Optimization calls:   {n_calls}")
+    print(f"  Tracks per call:      {N_THETA} theta x {N_PT} pT = {N_THETA * N_PT}")
     print(f"{'='*60}\n")
-
-    # Define search space based on actual layer count
-    # Get baseline radii to set reasonable ranges per layer
-    baseline_radii = [BASE_LAYERS[i]["rPos"] for i in FREE_BARREL_IDX]
-
-    # Half-lengths: 50-150 mm for inner, up to 2000 mm for outer
-    L_min, L_max = 0.050, 2.000
-    # Disk z-positions (if any)
-    Z_min, Z_max = 0.01, 2.5
 
     space = []
 
-    # Radii for free barrel layers - set ranges based on baseline values
-    # Allow ±30% variation around baseline, with sensible min/max bounds
-    for i in range(len(FREE_BARREL_IDX)):
-        r_baseline = baseline_radii[i]
-        r_min = max(0.020, r_baseline * 0.70)  # -30% but not below 20mm
-        r_max = min(1.600, r_baseline * 1.30)  # +30% but not above 1600mm
+    # Radii for free stations: ±30% around baseline, clipped so layers cannot
+    # cross each other, the beam pipe or fixed support shells
+    free = [STATIONS.index(s) for s in FREE_STATIONS]
+    r_bounds = station_radius_bounds(STATIONS, free, FIXED_RADII)
+    for i, (r_min, r_max) in enumerate(r_bounds):
         space.append(Real(r_min, r_max, name=f"R_barrel_{i}"))
 
-    # Half-lengths for free barrel layers
+    # Half-lengths as a fraction of the longest nozzle/disk-safe length
     for i in range(N_FREE_BARREL):
-        space.append(Real(L_min, L_max, name=f"L_barrel_{i}"))
+        space.append(Real(0.0, 1.0, name=f"f_barrel_{i}"))
 
-    # Z-positions for free disk layers
-    for i in range(N_FREE_DISK):
-        space.append(Real(Z_min, Z_max, name=f"Z_disk_{i}"))
+    # |z| of free disk stations (mirrored to -z), ordered and non-overlapping
+    z_bounds = disk_z_bounds(DISK_STATIONS)
+    z_bounds = [b for s, b in zip(DISK_STATIONS, z_bounds) if s in FREE_DISK_STATIONS]
+    for i, (z_min, z_max) in enumerate(z_bounds):
+        space.append(Real(z_min, z_max, name=f"Z_disk_{i}"))
 
     print(f"Search space defined with {len(space)} dimensions")
-    print(f"  Radii:   [adaptive per layer, ±30% around baseline]")
-    print(f"    VTX layers: ~{baseline_radii[0]:.3f} - {baseline_radii[min(7, len(baseline_radii)-1)]:.3f} m")
-    if len(baseline_radii) > 8:
-        print(f"    ITK/OTK layers: ~{baseline_radii[8]:.3f} - {baseline_radii[-1]:.3f} m")
-    print(f"  Lengths: [{L_min:.3f}, {L_max:.3f}] m")
+    print(f"  Radii (ordered, non-overlapping):")
+    for s, (r_min, r_max) in zip(FREE_STATIONS, r_bounds):
+        print(f"    {s['label']:<4} R0={s['R0']:.4f}  ->  [{r_min:.4f}, {r_max:.4f}] m")
+    print(f"  Lengths: L = {L_MIN:.3f} + f * (L_max(R) - {L_MIN:.3f}), f in [0, 1], L_max <= {L_ABS_MAX:.3f} m")
     if N_FREE_DISK > 0:
-        print(f"  Disk Z:  [{Z_min:.3f}, {Z_max:.3f}] m")
+        print(f"  Disk |z| (mirrored to -z, ordered, non-overlapping):")
+        for s, (z_min, z_max) in zip(FREE_DISK_STATIONS, z_bounds):
+            print(f"    {s['label']:<6} Z0={s['Z0']:.4f}  ->  [{z_min:.4f}, {z_max:.4f}] m")
     print()
+
+    x0 = baseline_theta()
+    y0 = score(x0)
+    print(f"Baseline seeded into the optimizer: loss = {y0:.4f}\n")
 
     res = gp_minimize(
         func=score,
         dimensions=space,
+        x0=[list(x0)],
+        y0=[y0],
         acq_func="EI",           # Expected Improvement
         n_calls=n_calls,
         n_initial_points=n_initial_points,
+        noise=GP_NOISE,
         random_state=42,
         verbose=True,
     )
 
+    best_layers = build_layers_from_theta(res.x)
+    best_L = [best_layers[s["sensors"][0]]["xMax"] for s in FREE_STATIONS]
+
     print(f"\n{'='*60}")
     print("=== Optimization Finished ===")
     print(f"{'='*60}")
-    print(f"Best loss:   {res.fun:.6f}")
+    print(f"Best loss:   {res.fun:.6f}  (baseline = {y0:.6f})")
     print(f"Best params: {res.x}")
-    print(f"\nBest radii (m):       {res.x[:N_FREE_BARREL]}")
-    print(f"Best half-lengths (m): {res.x[N_FREE_BARREL:2*N_FREE_BARREL]}")
+    print(f"\nBest radii (m):        {res.x[:N_FREE_BARREL]}")
+    print(f"Best half-lengths (m): {best_L}")
     if N_FREE_DISK > 0:
         print(f"Best disk z (m):      {res.x[2*N_FREE_BARREL:]}")
 
     # Write best geometry file
-    best_file = "opt/GeoBEST.txt"
+    best_file = OPT_DIR / "GeoBEST.txt"
     write_geo_from_theta(res.x, out_path=best_file)
     print(f"\nBest geometry written to: {best_file}")
     draw_from_file(best_file)
-    print(f"Geometry plot saved to: opt/geometry.png")
+    print(f"Geometry plot saved to: {OPT_DIR / 'geometry.png'}")
 
     return res
 
 def build_layers_from_theta(theta):
     '''
-    Given θ = [R_1..R_N, L_1..L_N], return a fresh list of layer dicts
-    with updated radii and xMin/xMax for the free barrel layers.
+    Given θ = [R_1..R_N, f_1..f_N, Z_1..Z_M], return a fresh list of layer
+    dicts. Disk stations are placed first (mirrored to -z, inner radius
+    following the nozzle, see disk_rmin); then each free barrel station moves rigidly to
+    radius R (members keep their radial offsets) and gets half-length
+    L = L_MIN + f * (L_max - L_MIN), where L_max is the longest length that
+    clears the nozzle and every disk at that radius.
     '''
     theta = np.asarray(theta, dtype=float)
     if theta.shape[0] != THETA_DIM:
-        raise ValueError(f"theta length {theta.shape[0]} != 2 * N_FREE_LAYERS ({THETA_DIM})")
+        raise ValueError(f"theta length {theta.shape[0]} != 2 * N_FREE_BARREL + N_FREE_DISK ({THETA_DIM})")
 
     R = theta[:N_FREE_BARREL]
-    L = theta[N_FREE_BARREL:2*N_FREE_BARREL]
+    F = theta[N_FREE_BARREL:2*N_FREE_BARREL]
     Z = theta[2*N_FREE_BARREL:]
 
     # copy baseline layers
     layers = [dict(L0) for L0 in BASE_LAYERS]
 
-    # Update barrel layers
-    for r, ell, idx in zip(R, L, FREE_BARREL_IDX):
-        layers[idx]["rPos"] = float(r)
-        # enforce symmetric barrel: xMin = -L, xMax = +L
-        layers[idx]["xMin"] = float(-abs(ell))
-        layers[idx]["xMax"] = float(+abs(ell))
-    
-    # Update disk layers
-    for z, idx in zip(Z, FREE_DISK_IDX):
-        layers[idx]["rPos"] = float(z)
+    # Update disk stations: members keep their z offset, -z mirrors follow
+    for z, s in zip(Z, FREE_DISK_STATIONS):
+        for idx, mirror, dz in s["members"]:
+            z_new = float(z + dz)
+            for j, sign in ((idx, 1.0), (mirror, -1.0)):
+                layers[j]["rPos"] = sign * z_new
+                layers[j]["xMin"] = disk_rmin(BASE_LAYERS[j]["xMin"], BASE_LAYERS[j]["rPos"], z_new)
+
+    # Update barrel stations
+    for r, f, s in zip(R, F, FREE_STATIONS):
+        ell = length_from_fraction(f, station_length_max(s, r, layers))
+        for idx, dr in s["members"]:
+            layers[idx]["rPos"] = float(r + dr)
+            # enforce symmetric barrel: xMin = -L, xMax = +L
+            layers[idx]["xMin"] = float(-ell)
+            layers[idx]["xMax"] = float(+ell)
 
     return layers
 
-def initialize_optimization_config(n_inner_layers=7, optimize_disks=False):
+def initialize_optimization_config(n_stations=None, optimize_disks=False):
     """
     Initialize global configuration for optimization.
 
     Args:
-        n_inner_layers: Number of inner barrel layers to optimize (default: 7)
+        n_stations: Number of innermost barrel stations to optimize
+                    (default: all). VTX doublets count as one station.
         optimize_disks: Whether to also optimize disk layers (default: False)
     """
-    global BASE_LAYERS, FREE_BARREL_IDX, N_FREE_BARREL
-    global FREE_DISK_IDX, N_FREE_DISK, THETA_DIM
+    global BASE_LAYERS, STATIONS, FIXED_RADII, FREE_STATIONS, N_FREE_BARREL
+    global FREE_BARREL_IDX, DISK_STATIONS, FREE_DISK_STATIONS, N_FREE_DISK, THETA_DIM
 
     # Load base geometry
     BASE_LAYERS = load_layers(GEO_BASE)
     print(f"Loaded {len(BASE_LAYERS)} layers from {GEO_BASE}")
 
-    # Find all barrel measurement layers (tyLay=1, flLay=1)
-    all_barrel_idx = [
-        i for i, L in enumerate(BASE_LAYERS)
-        if L["tyLay"] == 1 and L["flLay"] == 1
-    ]
+    STATIONS, FIXED_RADII = build_stations(BASE_LAYERS)
+    FREE_STATIONS = STATIONS if n_stations is None else STATIONS[:n_stations]
+    N_FREE_BARREL = len(FREE_STATIONS)
+    FREE_BARREL_IDX = [idx for s in FREE_STATIONS for idx, _ in s["members"]]
 
-    # Take only the first N inner layers
-    FREE_BARREL_IDX = all_barrel_idx[:n_inner_layers]
-    N_FREE_BARREL = len(FREE_BARREL_IDX)
-
-    print(f"\nBarrel layers found: {len(all_barrel_idx)}")
-    print(f"Optimizing first {N_FREE_BARREL} inner layers: {FREE_BARREL_IDX}")
-    for idx in FREE_BARREL_IDX:
-        L = BASE_LAYERS[idx]
-        print(f"  Layer {idx}: {L['label']} at R={L['rPos']:.4f} m, "
-              f"L={0.5*(L['xMax']-L['xMin']):.4f} m")
+    print(f"\nBarrel stations found: {len(STATIONS)}")
+    print(f"Optimizing {N_FREE_BARREL} stations:")
+    for s in FREE_STATIONS:
+        sensors  = ", ".join(f"{BASE_LAYERS[i]['rPos']:.4f}" for i in s["sensors"])
+        supports = ", ".join(f"{BASE_LAYERS[i]['rPos']:.4f}" for i, _ in s["members"] if i not in s["sensors"])
+        L_max = station_length_max(s, s["R0"], BASE_LAYERS)
+        print(f"  {s['label']:<4} sensors R=[{sensors}]  supports R=[{supports}]  L={s['L0']:.4f} m (max {L_max:.4f})")
+    print(f"Fixed barrel layers at R = {[round(r, 4) for r in FIXED_RADII]}")
 
     # Optionally optimize disk layers
+    DISK_STATIONS = build_disk_stations(BASE_LAYERS)
     if optimize_disks:
-        FREE_DISK_IDX = [
-            i for i, L in enumerate(BASE_LAYERS)
-            if L["tyLay"] == 2 and L["flLay"] == 1
-        ]
-        N_FREE_DISK = len(FREE_DISK_IDX)
-        print(f"\nOptimizing {N_FREE_DISK} disk layers: {FREE_DISK_IDX}")
+        FREE_DISK_STATIONS = DISK_STATIONS
+        N_FREE_DISK = len(FREE_DISK_STATIONS)
+        print(f"\nOptimizing {N_FREE_DISK} disk stations (each mirrored to -z):")
+        for s in FREE_DISK_STATIONS:
+            passive = [f"{BASE_LAYERS[i]['rPos']:.4f}" for i, _, dz in s["members"] if dz != 0.0]
+            print(f"  {s['label']:<6} z={s['Z0']:.4f}  r=[{s['rmin']:.4f}, {s['rmax']:.4f}]  supports z={passive}")
     else:
-        FREE_DISK_IDX = []
+        FREE_DISK_STATIONS = []
         N_FREE_DISK = 0
         print("\nKeeping all disk layers FIXED")
 
     THETA_DIM = 2 * N_FREE_BARREL + N_FREE_DISK
     print(f"\nTotal optimization parameters: {THETA_DIM}")
-    print(f"  {N_FREE_BARREL} radii + {N_FREE_BARREL} half-lengths + {N_FREE_DISK} disk z-positions")
+    print(f"  {N_FREE_BARREL} radii + {N_FREE_BARREL} length fractions + {N_FREE_DISK} disk |z| positions")
 
 
 if __name__ == "__main__":
-    # Initialize configuration: optimize all barrel layers (VTX + ITK + OTK)
-    initialize_optimization_config(n_inner_layers=14, optimize_disks=False)
+    parser = argparse.ArgumentParser(description="Bayesian optimization of the tracker layout")
+    parser.add_argument("--n-calls", type=int, default=200,
+                        help="optimizer evaluations after the baseline (default: 200)")
+    parser.add_argument("--n-initial", type=int, default=40,
+                        help="random evaluations before the GP takes over (default: 40)")
+    parser.add_argument("--n-stations", type=int, default=None,
+                        help="optimize only the N innermost barrel stations (default: all)")
+    parser.add_argument("--no-disks", action="store_true",
+                        help="keep the disks fixed (default: disks are optimized too)")
+    args = parser.parse_args()
+
+    # Initialize configuration: barrel stations (VTX + ITK + OTK) and disks
+    initialize_optimization_config(n_stations=args.n_stations, optimize_disks=not args.no_disks)
 
     # Get initial parameter vector from baseline geometry
-    thetas_r = np.array([BASE_LAYERS[i]["rPos"] for i in FREE_BARREL_IDX])
-    thetas_l = np.array([0.5*(BASE_LAYERS[i]["xMax"]-BASE_LAYERS[i]["xMin"]) for i in FREE_BARREL_IDX])
-    thetas_z = np.array([BASE_LAYERS[i]['rPos'] for i in FREE_DISK_IDX]) if N_FREE_DISK > 0 else np.array([])
-
-    thetas = np.concatenate([thetas_r, thetas_l, thetas_z])
+    thetas = baseline_theta()
 
     print(f"\nInitial parameters (baseline):")
-    print(f"  Radii:       {thetas_r}")
-    print(f"  Half-lengths: {thetas_l}")
+    print(f"  Radii:            {thetas[:N_FREE_BARREL]}")
+    print(f"  Length fractions: {thetas[N_FREE_BARREL:2*N_FREE_BARREL]}")
     if N_FREE_DISK > 0:
-        print(f"  Disk z:      {thetas_z}")
+        print(f"  Disk |z|:         {thetas[2*N_FREE_BARREL:]}")
 
-    # Write baseline geometry and compute initial loss
+    # Write baseline geometry and draw it
     write_geo_from_theta(thetas)
     print(f"\nWrote baseline geometry to: {GEO_OPT}")
-
-    run_root_metrics(GEO_OPT, METRICS_FILE)
     draw_from_file(GEO_OPT)
-    L0 = score(thetas)
-    print(f"\n*** Baseline loss (before optimization): {L0:.6f} ***\n")
 
-    # Run Bayesian optimization
-    result = run_bayes_optimization(n_calls=50, n_initial_points=20)
-
-
+    # Run Bayesian optimization (evaluates and seeds the baseline itself)
+    result = run_bayes_optimization(n_calls=args.n_calls, n_initial_points=args.n_initial)
