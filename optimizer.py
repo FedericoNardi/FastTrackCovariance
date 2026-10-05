@@ -1,11 +1,18 @@
 from pathlib import Path
 import argparse
+import json
+import os
 import subprocess
 import numpy as np
 import uproot
 import matplotlib.pyplot as plt
 from skopt.space import Real
 from skopt import gp_minimize
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+from types import SimpleNamespace
+from threadpoolctl import threadpool_limits
+import time
 
 ROOT_DIR = Path(__file__).resolve().parent          # repo root: ROOT macros are loaded from here
 OPT_DIR  = ROOT_DIR / "opt"
@@ -13,12 +20,31 @@ OPT_DIR  = ROOT_DIR / "opt"
 GEO_BASE         = ROOT_DIR / "GeoCLD.txt"
 GEO_OPT          = OPT_DIR / "GeoOPT.txt"
 METRICS_FILE     = OPT_DIR / "metrics.root"
-METRICS_BASELINE = OPT_DIR / "metrics_baseline.root"
 RUNMETRICS_C     = "RunMetrics.cc"
 LOADALL_C        = "LoadAll.c"
 
 _cache = {}
 _baseline = None   # baseline resolutions, filled by baseline_metrics()
+
+# ============================================================================
+# COLLIDER MODE (set by initialize_optimization_config)
+#   MC: muon collider. The tungsten nozzles are present: barrels, disks and
+#       tracks must stay outside them, and they replace the beam pipe as the
+#       innermost passive element (the PIPE layer is dropped).
+#   HC: hadron collider. No nozzle; the beam pipe is the innermost passive layer.
+# ============================================================================
+COLLIDERS = ("MC", "HC")
+COLLIDER = "MC"
+
+def has_nozzle():
+    return COLLIDER == "MC"
+
+def geo_baseline_file():
+    """Baseline geometry as used in the current collider mode."""
+    return OPT_DIR / f"GeoBASE_{COLLIDER}.txt"
+
+def metrics_baseline_file():
+    return OPT_DIR / f"metrics_baseline_{COLLIDER}.root"
 
 # ============================================================================
 # TRACK GRID (passed to RunMetrics.cc)
@@ -31,17 +57,36 @@ N_PT, PT_MIN, PT_MAX   = 20, 0.5, 100.0    # log-spaced, GeV
 # ============================================================================
 DOUBLET_MAX_GAP = 0.005   # sensors of the same label/length closer than this move as one station (m)
 MIN_GAP         = 0.002   # minimum radial clearance between a station and anything else (m)
+# Interface between inner and outer tracker: the fixed passive layers lying
+# between the outermost INTERFACE_LABELS[0] station and the innermost
+# INTERFACE_LABELS[1] station (the ITK support tube) are surrounded by an empty
+# band: no station may come closer than INTERFACE_GAP to them.
+INTERFACE_LABELS = ("ITK", "OTK")
+INTERFACE_GAP   = 0.020   # (m)
 R_FRAC_LO, R_FRAC_HI = 0.70, 1.30   # station radius range relative to baseline
-R_ABS_MAX       = 1.600   # outer envelope for barrel layers (m)
+# Outer envelope (the calorimeter sits outside it). Set by
+# initialize_optimization_config to the bounding box of the base geometry
+# (beam pipe excluded): no barrel radius, barrel half-length or disk |z| may exceed it.
+R_ABS_MAX       = 1.600   # max barrel radius (m)
 CLEARANCE       = 0.001   # clearance to the nozzle and to disks (m)
-L_MIN, L_ABS_MAX = 0.050, 2.000     # barrel half-length range (m)
+L_MIN, L_ABS_MAX = 0.050, 2.000     # barrel half-length range (m); max set from the envelope
 Z_FRAC_LO, Z_FRAC_HI = 0.70, 1.30   # disk |z| range relative to baseline
-Z_ABS_MAX       = 2.500   # outer envelope for disks (m)
+Z_ABS_MAX       = 2.500   # max disk |z| (m); set from the envelope
 
 # ============================================================================
 # LOSS CONSTANTS
 # ============================================================================
 FAIL_LOSS = 3.0           # returned for failed evaluations; the baseline scores 1.0
+
+# ============================================================================
+# RESOURCES: use at most CPU_FRACTION of the node, both for the parallel ROOT
+# evaluations and for the threads of the GP fits (torch / BLAS)
+# ============================================================================
+CPU_FRACTION = 0.25
+
+def cpu_cap():
+    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+    return max(1, int(n * CPU_FRACTION))
 GP_NOISE  = 1e-6          # the objective is deterministic: fix a tiny noise variance
 
 # ============================================================================
@@ -74,8 +119,9 @@ def baseline_metrics():
     """Resolutions of the base geometry on the same track grid (computed once)."""
     global _baseline
     if _baseline is None:
-        run_root_metrics(GEO_BASE, METRICS_BASELINE)
-        _baseline = read_metrics(METRICS_BASELINE)
+        write_layers(BASE_LAYERS, geo_baseline_file())
+        run_root_metrics(geo_baseline_file(), metrics_baseline_file())
+        _baseline = read_metrics(metrics_baseline_file())
     return _baseline
 
 def compute_loss_from_metrics(metrics_path=METRICS_FILE):
@@ -108,7 +154,10 @@ def nozzle_profile(x):
     return np.where(x<1., m1*x, m2*x+q2)
 
 def nozzle_inverse(r):
-    """Largest |z| at which the nozzle radius is still below r (inverse of nozzle_profile)."""
+    """Largest |z| at which the nozzle radius is still below r (inverse of nozzle_profile).
+    Unbounded when there is no nozzle (HC)."""
+    if not has_nozzle():
+        return np.inf
     m1 = 0.1763
     m2 = 0.08474
     q2 = 9.156*0.01 # meters
@@ -125,6 +174,8 @@ def barrel_nozzle_penalty(theta, clearance=CLEARANCE, scale=0.01):
     different constraints. Zero by construction for lengths built by
     build_layers_from_theta; kept as a safety check.
     """
+    if not has_nozzle():
+        return 0.0
     layers = build_layers_from_theta(theta)
     penalty = 0.0
 
@@ -148,7 +199,9 @@ def barrel_disk_overlap_penalty(theta, clearance=CLEARANCE, scale=0.01):
     [r_min, r_max]) overlap when |z_d| < L_b and r_min < R_b < r_max, each
     widened by the clearance. The violation is the smallest displacement that
     resolves it: shortening the barrel or moving it radially off the disk.
-    Fixed disks are included, since free barrels can grow into them.
+    Fixed disks are included, since free barrels can grow into them, and so
+    are fixed barrel layers (support shells, not the beam pipe), since free
+    disks can move into them.
     Zero by construction for lengths built by build_layers_from_theta; kept
     as a safety check.
     """
@@ -156,8 +209,11 @@ def barrel_disk_overlap_penalty(theta, clearance=CLEARANCE, scale=0.01):
     penalty = 0.0
 
     disks = [L for L in layers if L["tyLay"] == 2]
+    fixed = {i for i, L in enumerate(layers)
+             if L["tyLay"] == 1 and L["label"] != "PIPE"
+             and i not in {idx for s in STATIONS for idx, _ in s["members"]}}
 
-    for idx in FREE_BARREL_IDX:
+    for idx in list(FREE_BARREL_IDX) + sorted(fixed):
         b = layers[idx]
         R_b = b["rPos"]
         L_b = max(abs(b["xMin"]), abs(b["xMax"]))
@@ -193,9 +249,11 @@ def length_from_fraction(f, L_max):
     """Map f in [0, 1] onto [L_MIN, L_max]."""
     return L_MIN + f * max(L_max - L_MIN, 0.0)
 
-def score(theta):
+def score(theta, workdir=None):
     """
     Objective function for Bayesian optimization.
+    workdir: directory for this evaluation's geometry, metrics and ROOT log
+             (needed when several evaluations run in parallel); default opt/.
     theta: [R_1, ..., R_N, f_1, ..., f_N, Z_1, ..., Z_M]
            R is the reference radius of each free station, f its half-length
            as a fraction of the longest allowed one (see station_length_max).
@@ -235,10 +293,15 @@ def score(theta):
         return FAIL_LOSS
 
     # --- base tracking loss ---
+    if workdir is None:
+        geo_file, metrics_file, log_file = GEO_OPT, METRICS_FILE, None
+    else:
+        workdir = Path(workdir)
+        geo_file, metrics_file, log_file = workdir / "GeoOPT.txt", workdir / "metrics.root", workdir / "root.log"
     try:
-        write_geo_from_theta(theta)
-        run_root_metrics(GEO_OPT, METRICS_FILE)
-        base_loss = compute_loss_from_metrics(METRICS_FILE)
+        write_geo_from_theta(theta, out_path=geo_file)
+        run_root_metrics(geo_file, metrics_file, log_file=log_file)
+        base_loss = compute_loss_from_metrics(metrics_file)
     except Exception as e:
         print(f"[ERROR] Failed to compute metrics: {e}")
         _cache[key] = FAIL_LOSS
@@ -263,10 +326,11 @@ def score(theta):
     _cache[key] = loss
     return loss
 
-def run_root_metrics(geo_file=GEO_OPT, metrics_file=METRICS_FILE):
+def run_root_metrics(geo_file=GEO_OPT, metrics_file=METRICS_FILE, log_file=None):
     """
     Run RunMetrics.cc on geo_file. The output file is removed first so a failed
     run can never leave the previous geometry's metrics behind to be read.
+    log_file: if given, ROOT's output goes there instead of the terminal.
     """
     metrics_file = Path(metrics_file)
     metrics_file.parent.mkdir(parents=True, exist_ok=True)
@@ -280,8 +344,12 @@ def run_root_metrics(geo_file=GEO_OPT, metrics_file=METRICS_FILE):
         f'{RUNMETRICS_C}+("{geo_file}", "{metrics_file}", '
         f'{N_THETA}, {THETA_MIN_DEG}, {N_PT}, {PT_MIN}, {PT_MAX})',
     ]
-    print("Running ROOT:", " ".join(cmd))
-    subprocess.run(cmd, check=True, cwd=ROOT_DIR)
+    if log_file is None:
+        print("Running ROOT:", " ".join(cmd))
+        subprocess.run(cmd, check=True, cwd=ROOT_DIR)
+    else:
+        with open(log_file, "w") as log:
+            subprocess.run(cmd, check=True, cwd=ROOT_DIR, stdout=log, stderr=subprocess.STDOUT)
 
     if not metrics_file.exists():
         raise RuntimeError(f"ROOT exited cleanly but did not write {metrics_file}")
@@ -292,7 +360,8 @@ def draw_from_file(geom_file=GEO_OPT, out_file=None, title=None):
 
     Active (measurement) layers are solid and coloured: barrels blue, disks
     red. Passive layers (supports, beam pipe) are grey and dashed; their line
-    width grows with their material budget. The nozzle region is shaded.
+    width grows with their material budget. The nozzle region is shaded
+    (MC only).
     """
     layers = load_layers(geom_file)
     out_file = Path(out_file) if out_file else OPT_DIR / "geometry.png"
@@ -301,10 +370,11 @@ def draw_from_file(geom_file=GEO_OPT, out_file=None, title=None):
     fig, (ax, axin) = plt.subplots(1, 2, figsize=(18, 8), gridspec_kw={"width_ratios": [3, 1]})
 
     def draw(ax, z_max):
-        # Nozzle (forbidden region)
-        z = np.linspace(0.0, z_max, 200)
-        for sign in (-1, 1):
-            ax.fill_between(sign * z, 0.0, nozzle_profile(z), color="0.85", lw=0)
+        # Nozzle (forbidden region, MC only)
+        if has_nozzle():
+            z = np.linspace(0.0, z_max, 200)
+            for sign in (-1, 1):
+                ax.fill_between(sign * z, 0.0, nozzle_profile(z), color="0.85", lw=0)
         for L in layers:
             active = L["flLay"] == 1
             x0 = L["thLay"] / L["rlLay"] if L["rlLay"] > 0 else 0.0   # fraction of X0
@@ -320,6 +390,16 @@ def draw_from_file(geom_file=GEO_OPT, out_file=None, title=None):
 
     draw(ax, z_lim)
 
+    # Inner/outer tracker interface keep-out band
+    iface = sorted(interface_radii(STATIONS, FIXED_RADII)) if STATIONS else []
+    if iface:
+        ax.fill_between([-Z_ABS_MAX, Z_ABS_MAX], iface[0] - INTERFACE_GAP, iface[-1] + INTERFACE_GAP,
+                        color="tab:green", alpha=0.12, lw=0)
+
+    # Tracker envelope (hard limit)
+    ax.add_patch(plt.Rectangle((-Z_ABS_MAX, 0.0), 2 * Z_ABS_MAX, R_ABS_MAX, fill=False,
+                               ec="tab:green", ls=":", lw=1.2))
+
     # Zoom on the vertex region (side panel)
     zi, ri = 0.35, 0.18
     draw(axin, zi)
@@ -334,14 +414,17 @@ def draw_from_file(geom_file=GEO_OPT, out_file=None, title=None):
         Line2D([], [], color="tab:blue", lw=1.8, label="active barrel"),
         Line2D([], [], color="tab:red", lw=1.8, label="active disk"),
         Line2D([], [], color="0.35", ls="--", lw=1.2, label="passive (width ~ X/X0)"),
-        plt.Rectangle((0, 0), 1, 1, color="0.85", label="nozzle"),
+        Line2D([], [], color="tab:green", ls=":", lw=1.2, label="envelope"),
+        plt.Rectangle((0, 0), 1, 1, color="tab:green", alpha=0.12, label="interface keep-out"),
     ]
+    if has_nozzle():
+        handles.append(plt.Rectangle((0, 0), 1, 1, color="0.85", label="nozzle"))
     ax.legend(handles=handles, loc="upper right", framealpha=0.9)
     ax.set_xlim(-z_lim, z_lim)
     ax.set_ylim(0.0, r_lim)
     ax.set_xlabel("z [m]")
     ax.set_ylabel("r [m]")
-    ax.set_title(title or Path(geom_file).name)
+    ax.set_title(f"{title or Path(geom_file).name}  [{COLLIDER}]")
     fig.tight_layout()
     fig.savefig(out_file, dpi=120)
     plt.close(fig)
@@ -477,6 +560,16 @@ def build_disk_stations(layers):
         s["dz_min"], s["dz_max"] = min(offsets), max(offsets)
     return stations
 
+def fixed_barrel_layers():
+    """
+    Barrel layers that never move (support shells), excluding the beam pipe:
+    in HC the pipe runs through the whole detector by design and the disks'
+    inner edge is set by the input geometry.
+    """
+    moved = {idx for s in STATIONS for idx, _ in s["members"]}
+    return [L for i, L in enumerate(BASE_LAYERS)
+            if L["tyLay"] == 1 and i not in moved and L["label"] != "PIPE"]
+
 def disk_z_bounds(stations, gap=MIN_GAP):
     """
     |z| bounds for each disk station such that disks cannot cross.
@@ -485,7 +578,8 @@ def disk_z_bounds(stations, gap=MIN_GAP):
     (e.g. ITK and OTK disks can share a z). Neighbouring overlapping stations
     split the space at the baseline midpoint with `gap` clearance, as for the
     barrel radii. A station also stays far enough out that barrels at its
-    radius can keep their minimum length. Bounds are additionally limited to
+    radius can keep their minimum length, and beyond the end of every fixed
+    barrel layer (support shell) it radially overlaps. Bounds are additionally limited to
     [Z_FRAC_LO, Z_FRAC_HI] x baseline and Z_ABS_MAX.
     """
     bounds = []
@@ -493,6 +587,11 @@ def disk_z_bounds(stations, gap=MIN_GAP):
         lo_k, hi_k = s["Z0"] + s["dz_min"], s["Z0"] + s["dz_max"]
         lo = max(Z_FRAC_LO * s["Z0"], L_MIN + CLEARANCE - s["dz_min"])
         hi = min(Z_FRAC_HI * s["Z0"], Z_ABS_MAX - s["dz_max"])
+        # Fixed barrel layers (support shells) that the disk radially overlaps
+        # cannot be shortened, so the disk must stay beyond their end
+        for b in fixed_barrel_layers():
+            if s["rmin"] - CLEARANCE < b["rPos"] < s["rmax"] + CLEARANCE:
+                lo = max(lo, max(abs(b["xMin"]), abs(b["xMax"])) + CLEARANCE - s["dz_min"])
         for n in stations:
             if n is s or not (n["rmin"] - gap < s["rmax"] and s["rmin"] < n["rmax"] + gap):
                 continue
@@ -512,15 +611,27 @@ def disk_rmin(rmin0, z0, z):
     """
     Inner radius of a disk moved from |z0| to |z|: keeps the baseline margin to
     the nozzle when moving outwards and never shrinks below the baseline.
+    Without a nozzle (HC) the inner radius is unchanged.
     """
+    if not has_nozzle():
+        return rmin0
     return max(rmin0, rmin0 + float(nozzle_profile(abs(z))) - float(nozzle_profile(abs(z0))))
+
+def interface_radii(stations, fixed_radii):
+    """Fixed barrel radii at the inner/outer tracker interface (see INTERFACE_LABELS)."""
+    inner = [s["R0"] + s["dr_max"] for s in stations if s["label"] == INTERFACE_LABELS[0]]
+    outer = [s["R0"] + s["dr_min"] for s in stations if s["label"] == INTERFACE_LABELS[1]]
+    if not inner or not outer:
+        return set()
+    return {r for r in fixed_radii if max(inner) < r < min(outer)}
 
 def station_radius_bounds(stations, free, fixed_radii, gap=MIN_GAP):
     """
     Radius bounds for each free station such that no two layers can cross.
 
     Every station keeps at least `gap` from fixed layers (beam pipe, support
-    shells) and from stations that are not optimized. Two neighbouring free
+    shells) and from stations that are not optimized, and INTERFACE_GAP from
+    the fixed layers at the inner/outer tracker interface. Two neighbouring free
     stations split the space between them at the baseline midpoint, so any
     point in the box is a valid ordering with at least `gap` clearance.
     Bounds are additionally limited to [R_FRAC_LO, R_FRAC_HI] x baseline.
@@ -530,6 +641,11 @@ def station_radius_bounds(stations, free, fixed_radii, gap=MIN_GAP):
     for k, s in enumerate(stations):
         items.append((s["R0"] + s["dr_min"], s["R0"] + s["dr_max"], k in free))
     items.sort()
+    interface = interface_radii(stations, fixed_radii)
+
+    def clearance(item):
+        """Gap to keep from a fixed neighbour: wider at the inner/outer tracker interface."""
+        return INTERFACE_GAP if item[0] in interface else gap
 
     bounds = []
     for k in free:
@@ -540,13 +656,13 @@ def station_radius_bounds(stations, free, fixed_radii, gap=MIN_GAP):
         lo = R_FRAC_LO * s["R0"]
         if pos > 0:
             p_in, p_out, p_free = items[pos - 1]
-            edge = 0.5 * (p_out + inner) + 0.5 * gap if p_free else p_out + gap
+            edge = 0.5 * (p_out + inner) + 0.5 * gap if p_free else p_out + clearance(items[pos - 1])
             lo = max(lo, edge - s["dr_min"])
 
         hi = min(R_FRAC_HI * s["R0"], R_ABS_MAX - s["dr_max"])
         if pos < len(items) - 1:
             n_in, n_out, n_free = items[pos + 1]
-            edge = 0.5 * (outer + n_in) - 0.5 * gap if n_free else n_in - gap
+            edge = 0.5 * (outer + n_in) - 0.5 * gap if n_free else n_in - clearance(items[pos + 1])
             hi = min(hi, edge - s["dr_max"])
 
         if not lo < hi:
@@ -564,9 +680,10 @@ def write_geo_from_theta(theta, out_path=GEO_OPT):
     if theta.shape[0] != THETA_DIM:
         raise ValueError(f"theta has length {theta.shape[0]}, expected {THETA_DIM}")
 
-    layers = build_layers_from_theta(theta)
+    write_layers(build_layers_from_theta(theta), out_path)
 
-    # write full geometry to file
+def write_layers(layers, out_path):
+    """Write a list of layer dicts in the GeoCLD.txt format read by SolGeom::GeoRead."""
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         for L in layers:
@@ -591,26 +708,109 @@ def baseline_theta():
     thetas_z = [s["Z0"] for s in FREE_DISK_STATIONS]
     return np.array(thetas_r + thetas_f + thetas_z, dtype=float)
 
-def run_bayes_optimization(n_calls=50, n_initial_points=20):
+def checkpoint_file():
+    return OPT_DIR / f"bo_checkpoint_{COLLIDER}.json"
+
+def best_geometry_file():
+    """Where a run writes its best geometry (and where --resume falls back to)."""
+    return OPT_DIR / f"GeoBEST_{COLLIDER}.txt"
+
+def checkpoint_config():
+    """What must match for a checkpoint to be resumable."""
+    return {
+        "collider": COLLIDER,
+        "theta_dim": THETA_DIM,
+        "stations": [[s["label"], round(s["R0"], 6)] for s in FREE_STATIONS],
+        "disk_stations": [[s["label"], round(s["Z0"], 6)] for s in FREE_DISK_STATIONS],
+        "track_grid": [N_THETA, THETA_MIN_DEG, N_PT, PT_MIN, PT_MAX],
+    }
+
+def save_checkpoint(x_iters, func_vals, path=None):
+    """Write all evaluations so far; atomic, so an interrupted run never leaves a broken file."""
+    path = Path(path or checkpoint_file())
+    data = {
+        "config": checkpoint_config(),
+        "x": [[float(v) for v in x] for x in x_iters],
+        "y": [float(v) for v in func_vals],
+    }
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+def load_checkpoint(path=None):
+    """Return (X, y) from a checkpoint written by the same configuration."""
+    path = Path(path or checkpoint_file())
+    if not path.exists():
+        raise FileNotFoundError(f"no checkpoint to resume from: {path}")
+    with open(path) as f:
+        data = json.load(f)
+    expected = checkpoint_config()
+    if data["config"] != expected:
+        diff = {k: (data["config"].get(k), v) for k, v in expected.items() if data["config"].get(k) != v}
+        raise ValueError(f"checkpoint {path} was written with a different configuration "
+                         f"(saved vs current): {diff}")
+    return data["x"], data["y"]
+
+def theta_from_geometry(geo_path, tol=1e-5):
     """
-    Run Bayesian optimization to find best layer configuration.
+    Parameter vector reproducing a geometry file written by this optimizer
+    (e.g. an earlier GeoBEST.txt) in the current configuration.
 
-    The baseline geometry is evaluated and passed to the optimizer as a
-    starting point, so the reported optimum can never be worse than it.
-
-    Args:
-        n_calls: Total number of optimization iterations (baseline excluded)
-        n_initial_points: Number of random initialization points
+    Radii and disk |z| are read from the stations' reference layers, length
+    fractions are recomputed against the disk positions in that file. Raises
+    ValueError if the file has a different layer structure or cannot be
+    reproduced (e.g. layers that are fixed now were moved there).
     """
-    print(f"\n{'='*60}")
-    print(f"Starting Bayesian Optimization")
-    print(f"  Free barrel stations: {N_FREE_BARREL}")
-    print(f"  Free disk layers:     {N_FREE_DISK}")
-    print(f"  Total parameters:     {THETA_DIM}")
-    print(f"  Optimization calls:   {n_calls}")
-    print(f"  Tracks per call:      {N_THETA} theta x {N_PT} pT = {N_THETA * N_PT}")
-    print(f"{'='*60}\n")
+    layers = load_layers(geo_path)
+    if [(L["tyLay"], L["label"], L["flLay"]) for L in layers] != \
+       [(L["tyLay"], L["label"], L["flLay"]) for L in BASE_LAYERS]:
+        raise ValueError(f"{geo_path}: layer structure differs from the base geometry "
+                         f"in collider mode {COLLIDER}")
+    R = [layers[s["sensors"][0]]["rPos"] for s in FREE_STATIONS]
+    Z = [layers[s["members"][0][0]]["rPos"] for s in FREE_DISK_STATIONS]
+    placed = build_layers_from_theta(np.r_[R, np.zeros(N_FREE_BARREL), Z])
+    F = []
+    for s, r in zip(FREE_STATIONS, R):
+        span = station_length_max(s, r, placed) - L_MIN
+        L = layers[s["sensors"][0]]["xMax"]
+        F.append(float(np.clip((L - L_MIN) / span, 0.0, 1.0)) if span > 0 else 0.0)
+    theta = np.r_[R, F, Z]
+    dev = max(abs(a[k] - b[k]) for a, b in zip(build_layers_from_theta(theta), layers)
+              for k in ("rPos", "xMin", "xMax"))
+    if dev > tol:
+        raise ValueError(f"{geo_path}: cannot be reproduced in the current configuration "
+                         f"(max deviation {dev:.2e} m)")
+    return theta
 
+def add_known_geometry(geo, space, X, Y):
+    """
+    Append the point reproducing geometry file `geo` to (X, Y), evaluating it
+    unless it is already known. Returns False (with a warning) if the file
+    cannot be used in the current configuration or search space.
+    """
+    try:
+        th = theta_from_geometry(geo)
+    except ValueError as e:
+        print(f"[WARNING] {e}")
+        return False
+    # Values read back from a 6-digit text file can sit a hair outside a bound
+    th = [float(np.clip(v, d.low, d.high)) if d.low - 1e-6 <= v <= d.high + 1e-6 else float(v)
+          for d, v in zip(space, th)]
+    if not all(d.low <= v <= d.high for d, v in zip(space, th)):
+        print(f"[WARNING] {geo} lies outside the current search space")
+        return False
+    key = tuple(np.round(th, 12))
+    if any(tuple(np.round(x, 12)) == key for x in X):
+        print(f"{geo} already known: loss = {_cache[key]:.4f}")
+        return True
+    X.append(th)
+    Y.append(score(th))
+    print(f"{geo} added as a known point: loss = {Y[-1]:.4f}")
+    return True
+
+def build_search_space():
+    """Search space of the current configuration (prints the ranges)."""
     space = []
 
     # Radii for free stations: ±30% around baseline, clipped so layers cannot
@@ -640,23 +840,249 @@ def run_bayes_optimization(n_calls=50, n_initial_points=20):
         for s, (z_min, z_max) in zip(FREE_DISK_STATIONS, z_bounds):
             print(f"    {s['label']:<6} Z0={s['Z0']:.4f}  ->  [{z_min:.4f}, {z_max:.4f}] m")
     print()
+    return space
 
-    x0 = baseline_theta()
-    y0 = score(x0)
-    print(f"Baseline seeded into the optimizer: loss = {y0:.4f}\n")
+def collect_known_points(space, n_initial_points, resume, seed_files):
+    """
+    Points the optimizer starts from: baseline, checkpoint (resume), previous
+    best geometry (resume without checkpoint) and seed files.
+    Returns (X, Y, y_base, n_random, seed).
+    """
+    x_base = [float(v) for v in baseline_theta()]
 
-    res = gp_minimize(
-        func=score,
-        dimensions=space,
-        x0=[list(x0)],
-        y0=[y0],
-        acq_func="EI",           # Expected Improvement
-        n_calls=n_calls,
-        n_initial_points=n_initial_points,
-        noise=GP_NOISE,
-        random_state=42,
-        verbose=True,
-    )
+    def in_space(x):
+        return all(d.low - 1e-12 <= v <= d.high + 1e-12 for d, v in zip(space, x))
+
+    # The baseline is always the reference (loss 1.0), but with tighter rules
+    # (e.g. INTERFACE_GAP) it can lie outside the search space and then cannot
+    # be given to the optimizer as a known point.
+    base_ok = in_space(x_base)
+    if not base_ok:
+        print("[NOTE] the baseline geometry is outside the current search space: "
+              "it stays the reference (loss 1.0) but is not a starting point")
+
+    if resume and not checkpoint_file().exists():
+        # No checkpoint: fall back to the previous run's best geometry
+        y_base = score(x_base)
+        X, Y = ([x_base], [y_base]) if base_ok else ([], [])
+        candidates = [best_geometry_file(), OPT_DIR / "GeoBEST.txt"]
+        print(f"No checkpoint {checkpoint_file()}: resuming from the previous best geometry")
+        if not any(f.exists() and add_known_geometry(f, space, X, Y) for f in candidates):
+            raise FileNotFoundError(f"nothing to resume from: no {checkpoint_file().name} "
+                                    f"and no usable {' / '.join(f.name for f in candidates)} in {OPT_DIR}")
+        n_random = n_initial_points   # the GP only knows these points: explore again
+        seed = 42 + len(X)
+        print()
+    elif resume:
+        X, Y = load_checkpoint()
+        # Points outside the current search space (bounds changed since) cannot be used
+        inside = [in_space(x) for x in X]
+        n_out = inside.count(False)
+        X = [x for x, ok in zip(X, inside) if ok]
+        Y = [y for y, ok in zip(Y, inside) if ok]
+        print(f"Resuming from {checkpoint_file()}: {len(X)} evaluations loaded"
+              + (f", {n_out} outside the current bounds dropped" if n_out else ""))
+        if not X:
+            raise RuntimeError("no usable evaluations in the checkpoint")
+        # Known points are never re-evaluated
+        for x, y in zip(X, Y):
+            _cache[tuple(np.round(x, 12))] = y
+        if tuple(np.round(x_base, 12)) not in _cache:
+            y_base = score(x_base)
+            if base_ok:
+                X.append(x_base)
+                Y.append(y_base)
+        y_base = _cache[tuple(np.round(x_base, 12))]
+        n_random = max(0, n_initial_points - (len(X) - int(base_ok)))
+        seed = 42 + len(X)          # do not replay the random points of the first run
+        print(f"Best so far: {min(Y):.4f}; {n_random} random points left, then GP\n")
+    else:
+        if checkpoint_file().exists():
+            prev = checkpoint_file().with_suffix(".prev.json")
+            os.replace(checkpoint_file(), prev)
+            print(f"Previous checkpoint moved to {prev}")
+        y_base = score(x_base)
+        X, Y = ([x_base], [y_base]) if base_ok else ([], [])
+        n_random = n_initial_points
+        seed = 42
+        print(f"Baseline loss = {y_base:.4f}" + (" (seeded into the optimizer)" if base_ok else "") + "\n")
+
+    # Extra known points from geometry files (e.g. the best result of an earlier run)
+    for geo in seed_files:
+        add_known_geometry(geo, space, X, Y)
+    if seed_files:
+        print()
+
+    # The optimizer needs at least one point to start from
+    if not X and n_random < 1:
+        n_random = 1
+    return X, Y, y_base, n_random, seed
+
+def evaluate_batch(thetas, workers):
+    """
+    Evaluate several parameter vectors in parallel, at most `workers` ROOT jobs
+    at a time, each in its own directory opt/workers/wNN (geometry, metrics,
+    root.log). Returns the losses in input order.
+    """
+    slots = Queue()
+    for i in range(workers):
+        d = OPT_DIR / "workers" / f"w{i:02d}"
+        d.mkdir(parents=True, exist_ok=True)
+        slots.put(d)
+
+    def run(theta):
+        d = slots.get()
+        try:
+            return score(theta, workdir=d)
+        finally:
+            slots.put(d)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(run, thetas))
+
+def run_skopt(space, X, Y, n_calls, n_random, seed, workers):
+    """Sequential GP-EI with scikit-optimize (one evaluation per GP fit)."""
+    # skopt needs n_calls >= random points: use only as many as the budget allows
+    if n_random > n_calls:
+        print(f"[NOTE] {n_random} random initial points requested but only {n_calls} calls: "
+              f"using {n_calls} random points, the GP takes over in a later --resume")
+        n_random = n_calls
+
+    def checkpoint(res):
+        save_checkpoint(res.x_iters, res.func_vals)
+
+    with threadpool_limits(limits=workers):
+        res = gp_minimize(
+            func=score,
+            dimensions=space,
+            x0=X or None,            # skopt rejects an empty list
+            y0=Y or None,
+            acq_func="EI",           # Expected Improvement
+            n_calls=n_calls,
+            n_initial_points=n_random,
+            noise=GP_NOISE,
+            random_state=seed,
+            callback=[checkpoint],
+            verbose=True,
+        )
+    return [list(map(float, x)) for x in res.x_iters], [float(y) for y in res.func_vals]
+
+def run_botorch(space, X, Y, n_calls, n_random, seed, batch, workers):
+    """
+    Batch Bayesian optimization with BoTorch: each round fits one GP to all
+    known points and proposes `batch` geometries with q-LogEI, which are then
+    evaluated in parallel (`workers` ROOT jobs at a time).
+    """
+    import torch
+    from torch.quasirandom import SobolEngine
+    from botorch.models import SingleTaskGP
+    from botorch.models.transforms.outcome import Standardize
+    from botorch.fit import fit_gpytorch_mll
+    from botorch.acquisition.logei import qLogExpectedImprovement
+    from botorch.optim import optimize_acqf
+    from gpytorch.mlls import ExactMarginalLogLikelihood
+
+    torch.set_num_threads(workers)
+    dtype = torch.double
+    lo = np.array([d.low for d in space])
+    hi = np.array([d.high for d in space])
+    dim = len(space)
+    unit_bounds = torch.stack([torch.zeros(dim, dtype=dtype), torch.ones(dim, dtype=dtype)])
+    sobol = SobolEngine(dim, scramble=True, seed=seed)
+
+    X, Y = list(X), list(Y)
+    done, rnd = 0, 0
+    while done < n_calls:
+        q = min(batch, n_calls - done)
+        t0 = time.time()
+        if n_random > 0 or len(X) < 2:
+            # Initial exploration: quasi-random (Sobol) points
+            q = min(q, max(n_random, 1))
+            cand = sobol.draw(q).to(dtype)
+            n_random -= q
+            how = "random"
+        else:
+            train_X = torch.tensor((np.array(X) - lo) / (hi - lo), dtype=dtype)
+            train_Y = -torch.tensor(Y, dtype=dtype).unsqueeze(-1)     # BoTorch maximizes
+            model = SingleTaskGP(train_X, train_Y, train_Yvar=torch.full_like(train_Y, GP_NOISE),
+                                 outcome_transform=Standardize(m=1))
+            with threadpool_limits(limits=workers):
+                fit_gpytorch_mll(ExactMarginalLogLikelihood(model.likelihood, model))
+                acq = qLogExpectedImprovement(model, best_f=train_Y.max())
+                cand, _ = optimize_acqf(acq, bounds=unit_bounds, q=q, num_restarts=10,
+                                        raw_samples=512, sequential=True)
+            how = "GP q-LogEI"
+        t_prop = time.time() - t0
+
+        thetas = [list(map(float, lo + np.clip(c, 0.0, 1.0) * (hi - lo))) for c in cand.detach().numpy()]
+        t0 = time.time()
+        ys = evaluate_batch(thetas, workers)
+        t_eval = time.time() - t0
+
+        X += thetas
+        Y += [float(y) for y in ys]
+        done += len(thetas)
+        rnd += 1
+        save_checkpoint(X, Y)
+        print(f"[round {rnd}] {len(thetas)} {how} points: batch best {min(ys):.4f}, "
+              f"overall best {min(Y):.4f} ({len(Y)} points) | propose {t_prop:.1f} s, "
+              f"evaluate {t_eval:.1f} s | {done}/{n_calls} calls")
+    return X, Y
+
+def run_bayes_optimization(n_calls=50, n_initial_points=20, resume=False, seed_files=(),
+                           backend="botorch", batch_size=None, workers=None):
+    """
+    Run Bayesian optimization to find best layer configuration.
+
+    The baseline geometry is evaluated and passed to the optimizer as a
+    starting point (if it lies in the search space), so the reported optimum
+    can never be worse than it.
+
+    Every evaluation is saved to checkpoint_file() as it happens. With
+    resume=True, the evaluations in that file are given to the optimizer as
+    already-known points (no ROOT re-runs) and the search continues from them.
+    If there is no checkpoint (e.g. a run made before checkpointing existed),
+    resume starts from the best geometry of the previous run instead
+    (best_geometry_file(), or the older name opt/GeoBEST.txt) plus the baseline.
+
+    Args:
+        n_calls: Number of new evaluations (baseline and resumed points excluded)
+        n_initial_points: Number of random evaluations before the GP takes
+            over, counted over the whole run including resumed ones
+        resume: Continue from checkpoint_file() instead of starting fresh
+        seed_files: Geometry files (e.g. an earlier GeoBEST.txt) added as known
+            points; each costs one evaluation unless already in the checkpoint
+        backend: "botorch" (batches evaluated in parallel) or "skopt" (sequential)
+        batch_size: geometries proposed per GP fit (botorch); default = workers
+        workers: parallel ROOT jobs and GP threads; default cpu_cap()
+    """
+    workers = workers or cpu_cap()
+    batch_size = batch_size or workers
+
+    print(f"\n{'='*60}")
+    print(f"Starting Bayesian Optimization")
+    print(f"  Free barrel stations: {N_FREE_BARREL}")
+    print(f"  Free disk layers:     {N_FREE_DISK}")
+    print(f"  Total parameters:     {THETA_DIM}")
+    print(f"  Optimization calls:   {n_calls}")
+    print(f"  Tracks per call:      {N_THETA} theta x {N_PT} pT = {N_THETA * N_PT}")
+    print(f"  Backend:              {backend}" + (f" (batch {batch_size})" if backend == "botorch" else ""))
+    print(f"  CPU cores used:       {workers} (cap {CPU_FRACTION:.0%} of the node)")
+    print(f"{'='*60}\n")
+
+    space = build_search_space()
+    X, Y, y_base, n_random, seed = collect_known_points(space, n_initial_points, resume, seed_files)
+
+    if backend == "skopt":
+        X, Y = run_skopt(space, X, Y, n_calls, n_random, seed, workers)
+    elif backend == "botorch":
+        X, Y = run_botorch(space, X, Y, n_calls, n_random, seed, batch_size, workers)
+    else:
+        raise ValueError(f"unknown backend {backend!r}")
+
+    ibest = int(np.argmin(Y))
+    res = SimpleNamespace(x=X[ibest], fun=Y[ibest], x_iters=X, func_vals=np.array(Y))
+    y0 = y_base
 
     best_layers = build_layers_from_theta(res.x)
     best_L = [best_layers[s["sensors"][0]]["xMax"] for s in FREE_STATIONS]
@@ -672,11 +1098,12 @@ def run_bayes_optimization(n_calls=50, n_initial_points=20):
         print(f"Best disk z (m):      {res.x[2*N_FREE_BARREL:]}")
 
     # Write best geometry file
-    best_file = OPT_DIR / "GeoBEST.txt"
+    best_file = best_geometry_file()
     write_geo_from_theta(res.x, out_path=best_file)
     print(f"\nBest geometry written to: {best_file}")
     draw_from_file(best_file)
     print(f"Geometry plot saved to: {OPT_DIR / 'geometry.png'}")
+    print(f"All {len(res.func_vals)} evaluations saved in: {checkpoint_file()}")
 
     return res
 
@@ -719,7 +1146,23 @@ def build_layers_from_theta(theta):
 
     return layers
 
-def initialize_optimization_config(n_stations=None, optimize_disks=False):
+def tracker_envelope(layers):
+    """
+    Bounding box (r_max, |z|_max) of all layers except the beam pipe: barrels
+    contribute their radius and half-length, disks their outer radius and |z|.
+    """
+    r_max = z_max = 0.0
+    for L in layers:
+        if L["label"] == "PIPE":
+            continue
+        if L["tyLay"] == 1:
+            r, z = L["rPos"], max(abs(L["xMin"]), abs(L["xMax"]))
+        else:
+            r, z = L["xMax"], abs(L["rPos"])
+        r_max, z_max = max(r_max, r), max(z_max, z)
+    return r_max, z_max
+
+def initialize_optimization_config(n_stations=None, optimize_disks=False, collider="MC"):
     """
     Initialize global configuration for optimization.
 
@@ -727,13 +1170,33 @@ def initialize_optimization_config(n_stations=None, optimize_disks=False):
         n_stations: Number of innermost barrel stations to optimize
                     (default: all). VTX doublets count as one station.
         optimize_disks: Whether to also optimize disk layers (default: False)
+        collider: "MC" (muon collider: nozzle, no beam pipe layer) or
+                  "HC" (hadron collider: beam pipe, no nozzle)
     """
-    global BASE_LAYERS, STATIONS, FIXED_RADII, FREE_STATIONS, N_FREE_BARREL
+    global R_ABS_MAX, L_ABS_MAX, Z_ABS_MAX
+    global COLLIDER, _baseline, BASE_LAYERS, STATIONS, FIXED_RADII, FREE_STATIONS, N_FREE_BARREL
     global FREE_BARREL_IDX, DISK_STATIONS, FREE_DISK_STATIONS, N_FREE_DISK, THETA_DIM
+
+    if collider not in COLLIDERS:
+        raise ValueError(f"collider must be one of {COLLIDERS}, got {collider!r}")
+    COLLIDER = collider
+    _baseline = None
+    _cache.clear()
 
     # Load base geometry
     BASE_LAYERS = load_layers(GEO_BASE)
     print(f"Loaded {len(BASE_LAYERS)} layers from {GEO_BASE}")
+    # Hard outer envelope = bounding box of the base geometry (beam pipe excluded)
+    R_ABS_MAX, Z_env = tracker_envelope(BASE_LAYERS)
+    L_ABS_MAX = Z_ABS_MAX = Z_env
+    print(f"Envelope (from base geometry): r <= {R_ABS_MAX:.4f} m, |z| <= {Z_env:.4f} m")
+
+    if has_nozzle():
+        n_pipe = sum(L["label"] == "PIPE" for L in BASE_LAYERS)
+        BASE_LAYERS = [L for L in BASE_LAYERS if L["label"] != "PIPE"]
+        print(f"Collider MC: nozzle on, {n_pipe} beam pipe layer(s) removed")
+    else:
+        print("Collider HC: no nozzle, beam pipe kept")
 
     STATIONS, FIXED_RADII = build_stations(BASE_LAYERS)
     FREE_STATIONS = STATIONS if n_stations is None else STATIONS[:n_stations]
@@ -778,10 +1241,29 @@ if __name__ == "__main__":
                         help="optimize only the N innermost barrel stations (default: all)")
     parser.add_argument("--no-disks", action="store_true",
                         help="keep the disks fixed (default: disks are optimized too)")
+    parser.add_argument("--resume", action="store_true",
+                        help="continue from opt/bo_checkpoint_<collider>.json (same configuration), "
+                             "or, if there is none, from the previous best geometry "
+                             "opt/GeoBEST_<collider>.txt; --n-calls then counts the additional evaluations")
+    parser.add_argument("--seed", nargs="+", default=[], metavar="GEO",
+                        help="geometry file(s) written by this optimizer (e.g. an earlier "
+                             "opt/GeoBEST.txt) to add as known starting points")
+    parser.add_argument("--backend", choices=("botorch", "skopt"), default="botorch",
+                        help="botorch: batches of geometries evaluated in parallel (default); "
+                             "skopt: one evaluation at a time")
+    parser.add_argument("--workers", type=int, default=None,
+                        help=f"parallel ROOT jobs and GP threads (default: {CPU_FRACTION:.0%} "
+                             f"of the cores = {cpu_cap()})")
+    parser.add_argument("--batch", type=int, default=None,
+                        help="geometries proposed per GP fit with botorch (default: = workers)")
+    parser.add_argument("--collider", choices=COLLIDERS, default="MC",
+                        help="MC: muon collider with nozzle, no beam pipe layer; "
+                             "HC: hadron collider with beam pipe, no nozzle (default: MC)")
     args = parser.parse_args()
 
     # Initialize configuration: barrel stations (VTX + ITK + OTK) and disks
-    initialize_optimization_config(n_stations=args.n_stations, optimize_disks=not args.no_disks)
+    initialize_optimization_config(n_stations=args.n_stations, optimize_disks=not args.no_disks,
+                                   collider=args.collider)
 
     # Get initial parameter vector from baseline geometry
     thetas = baseline_theta()
@@ -795,7 +1277,10 @@ if __name__ == "__main__":
     # Write baseline geometry and draw it
     write_geo_from_theta(thetas)
     print(f"\nWrote baseline geometry to: {GEO_OPT}")
-    draw_from_file(GEO_OPT)
+    draw_from_file(GEO_OPT, OPT_DIR / "geometry_start.png", "baseline")
+    print(f"Baseline plot saved to: {OPT_DIR / 'geometry_start.png'}")
 
     # Run Bayesian optimization (evaluates and seeds the baseline itself)
-    result = run_bayes_optimization(n_calls=args.n_calls, n_initial_points=args.n_initial)
+    result = run_bayes_optimization(n_calls=args.n_calls, n_initial_points=args.n_initial,
+                                    resume=args.resume, seed_files=args.seed, backend=args.backend,
+                                    batch_size=args.batch, workers=args.workers)

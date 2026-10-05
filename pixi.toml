@@ -12,6 +12,8 @@ numpy = "*"
 uproot = "*"
 matplotlib = "*"
 scikit-optimize = ">=0.10"
+botorch = ">=0.12"
+pytorch = ">=2.4"
 
 [tasks]
 optimize = "python optimizer.py"
