@@ -13,6 +13,7 @@ from queue import Queue
 from types import SimpleNamespace
 from threadpoolctl import threadpool_limits
 import time
+import threading
 
 ROOT_DIR = Path(__file__).resolve().parent          # repo root: ROOT macros are loaded from here
 OPT_DIR  = ROOT_DIR / "opt"
@@ -25,6 +26,7 @@ LOADALL_C        = "LoadAll.c"
 
 _cache = {}
 _baseline = None   # baseline resolutions, filled by baseline_metrics()
+_baseline_lock = threading.Lock()   # parallel evaluations must not compute it twice
 
 # ============================================================================
 # COLLIDER MODE (set by initialize_optimization_config)
@@ -79,6 +81,21 @@ Z_ABS_MAX       = 2.500   # max disk |z| (m); set from the envelope
 FAIL_LOSS = 3.0           # returned for failed evaluations; the baseline scores 1.0
 
 # ============================================================================
+# TRACK-FINDING MODEL (placeholders, to be tuned to the real reconstruction)
+# A track is found if it has at least SEED_HITS_MIN hits in the seed
+# subsystems AND at least N_HITS_MIN measured hits in total. Every crossed
+# measurement layer gives a hit with probability HIT_EFF[label], so the
+# finding efficiency of each track is a smooth function of the geometry.
+# Loss = efficiency-weighted resolution ratio + EFF_WEIGHT * (1 - eff/eff_baseline)
+# ============================================================================
+N_HITS_MIN    = 6
+SEED_HITS_MIN = 3
+SEED_LABELS   = ("VTX", "VTXDSK", "ITK", "ITKDSK")
+HIT_EFF       = {"VTX": 0.98, "VTXDSK": 0.98, "ITK": 0.98, "ITKDSK": 0.98, "OTK": 0.98, "OTKDSK": 0.98}
+HIT_EFF_DEFAULT = 0.98
+EFF_WEIGHT    = 1.0       # 1% relative efficiency loss costs as much as 1% worse resolution
+
+# ============================================================================
 # RESOURCES: use at most CPU_FRACTION of the node, both for the parallel ROOT
 # evaluations and for the threads of the GP fits (torch / BLAS)
 # ============================================================================
@@ -87,7 +104,20 @@ CPU_FRACTION = 0.25
 def cpu_cap():
     n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
     return max(1, int(n * CPU_FRACTION))
-GP_NOISE  = 1e-6          # the objective is deterministic: fix a tiny noise variance
+GP_NOISE  = 1e-6          # the objective is deterministic: fix a tiny noise variance (skopt)
+GP_NOISE_REL = 1e-4       # same for BoTorch, as a fraction of the variance of the fitted outcome
+
+# Thompson sampling in a trust region (TuRBO, Eriksson et al. 2019; BoTorch backend).
+# Candidates are drawn in a box around the best point, scaled per parameter by
+# the GP length scales. The box (edge TR_LENGTH_INIT in the unit cube) doubles
+# after TR_SUCCESS_ROUNDS improving rounds, halves after enough failed rounds
+# and is reset to TR_LENGTH_INIT once smaller than TR_LENGTH_MIN.
+TS_CANDIDATES      = 5000
+TR_LENGTH_INIT     = 0.8
+TR_LENGTH_MIN      = 0.5 ** 7
+TR_LENGTH_MAX      = 1.6
+TR_SUCCESS_ROUNDS  = 3
+TR_IMPROVEMENT     = 1e-3   # relative improvement of the best loss that counts as success
 
 # ============================================================================
 # GLOBAL CONFIGURATION - Initialized by initialize_optimization_config()
@@ -118,34 +148,74 @@ def read_metrics(metrics_path):
 def baseline_metrics():
     """Resolutions of the base geometry on the same track grid (computed once)."""
     global _baseline
-    if _baseline is None:
-        write_layers(BASE_LAYERS, geo_baseline_file())
-        run_root_metrics(geo_baseline_file(), metrics_baseline_file())
-        _baseline = read_metrics(metrics_baseline_file())
+    with _baseline_lock:
+        if _baseline is None:
+            write_layers(BASE_LAYERS, geo_baseline_file())
+            run_root_metrics(geo_baseline_file(), metrics_baseline_file())
+            base = read_metrics(metrics_baseline_file())
+            base["eff_mean"] = float(np.mean(track_efficiencies(base, BASE_LAYERS)))
+            _baseline = base
     return _baseline
 
-def compute_loss_from_metrics(metrics_path=METRICS_FILE):
-    """
-    Compute tracking performance loss from ROOT metrics file, relative to the
-    baseline geometry evaluated on the same tracks.
+def _pmf_at_least(probs, k):
+    """P(at least k successes) for independent trials with success probabilities `probs`."""
+    pmf = np.zeros(len(probs) + 1); pmf[0] = 1.0
+    for p in probs:
+        pmf[1:] = pmf[1:] * (1 - p) + pmf[:-1] * p
+        pmf[0] *= (1 - p)
+    return pmf
 
-    Each track's σ(pT)/pT and σ(d0) is divided by the baseline value for that
-    track, so every (θ, pT) point counts equally and both resolutions are
-    dimensionless. Returns the average of the mean pT and d0 ratios: the
-    baseline scores exactly 1.0, a uniform 10% improvement scores 0.9.
-
-    Lower is better.
+def track_efficiencies(arr, layers):
     """
+    Finding efficiency of every track in a metrics tree (see TRACK-FINDING MODEL).
+    `layers` is the geometry the metrics were computed with: the stored layer
+    indices refer to it.
+    """
+    labels = [L["label"] for L in layers]
+    eff = np.empty(len(arr["nmeas"]))
+    for t, idx in enumerate(arr["mlay"]):
+        seed = [HIT_EFF.get(labels[i], HIT_EFF_DEFAULT) for i in idx if labels[i] in SEED_LABELS]
+        other = [HIT_EFF.get(labels[i], HIT_EFF_DEFAULT) for i in idx if labels[i] not in SEED_LABELS]
+        ps, po = _pmf_at_least(seed, 0), _pmf_at_least(other, 0)
+        tail_o = np.cumsum(po[::-1])[::-1]              # P(other >= m)
+        e = 0.0
+        for n_seed in range(SEED_HITS_MIN, len(seed) + 1):
+            need = max(0, N_HITS_MIN - n_seed)
+            e += ps[n_seed] * (tail_o[need] if need < len(tail_o) else 0.0)
+        eff[t] = e
+    return eff
+
+def loss_components(metrics_path=METRICS_FILE, layers=None):
+    """
+    Loss and its parts for one metrics file, relative to the baseline geometry
+    evaluated on the same tracks:
+
+      res  = sum_t eff_t * r_t / sum_t eff_t,  r_t = (σpT/pT ratio + σd0 ratio) / 2
+             (resolution ratios to the baseline, weighted by finding efficiency,
+              so unfindable tracks do not dominate with huge resolutions)
+      eff  = mean finding efficiency over the track grid
+      loss = res + EFF_WEIGHT * (1 - eff / eff_baseline)
+
+    The baseline scores exactly 1.0. Lower is better.
+    `layers`: geometry the metrics belong to (default: read GEO_OPT).
+    """
+    if layers is None:
+        layers = load_layers(GEO_OPT)
     arr = read_metrics(metrics_path)
     base = baseline_metrics()
     if not (np.allclose(arr["pt"], base["pt"]) and np.allclose(arr["theta_deg"], base["theta_deg"])):
         raise RuntimeError("track grid differs from the baseline metrics")
 
-    r_pT = float(np.mean(arr["spt_rel"] / base["spt_rel"]))
-    r_d0 = float(np.mean(arr["sd0_um"] / base["sd0_um"]))
+    r = 0.5 * (arr["spt_rel"] / base["spt_rel"]) + 0.5 * (arr["sd0_um"] / base["sd0_um"])
+    eff = track_efficiencies(arr, layers)
+    res = float(np.sum(eff * r) / np.sum(eff)) if np.sum(eff) > 0 else FAIL_LOSS
+    e_mean = float(np.mean(eff))
+    loss = res + EFF_WEIGHT * (1.0 - e_mean / base["eff_mean"])
+    return {"loss": loss, "res": res, "eff": e_mean, "eff_base": base["eff_mean"]}
 
-    alpha, beta = 0.5, 0.5
-    return alpha * r_pT + beta * r_d0
+def compute_loss_from_metrics(metrics_path=METRICS_FILE, layers=None):
+    """Scalar loss of a metrics file (see loss_components)."""
+    return loss_components(metrics_path, layers)["loss"]
 
 def nozzle_profile(x):
     m1 = 0.1763
@@ -299,9 +369,11 @@ def score(theta, workdir=None):
         workdir = Path(workdir)
         geo_file, metrics_file, log_file = workdir / "GeoOPT.txt", workdir / "metrics.root", workdir / "root.log"
     try:
-        write_geo_from_theta(theta, out_path=geo_file)
+        layers = build_layers_from_theta(theta)
+        write_layers(layers, geo_file)
         run_root_metrics(geo_file, metrics_file, log_file=log_file)
-        base_loss = compute_loss_from_metrics(metrics_file)
+        parts = loss_components(metrics_file, layers)
+        base_loss = parts["loss"]
     except Exception as e:
         print(f"[ERROR] Failed to compute metrics: {e}")
         _cache[key] = FAIL_LOSS
@@ -319,6 +391,7 @@ def score(theta, workdir=None):
     L_b = [layers[s["sensors"][0]]["xMax"] for s in FREE_STATIONS]
     print(
         f"R_b={[f'{r:.4f}' for r in R_b]}, L_b={[f'{l:.4f}' for l in L_b]} -> "
+        f"res={parts['res']:.4f}, eff={parts['eff']:.4f} (base {parts['eff_base']:.4f}), "
         f"base={base_loss:.4f}, nozzle={nozzle_penalty:.4g}, "
         f"overlap={overlap_penalty:.4g}, total={loss:.4f}"
     )
@@ -723,6 +796,9 @@ def checkpoint_config():
         "stations": [[s["label"], round(s["R0"], 6)] for s in FREE_STATIONS],
         "disk_stations": [[s["label"], round(s["Z0"], 6)] for s in FREE_DISK_STATIONS],
         "track_grid": [N_THETA, THETA_MIN_DEG, N_PT, PT_MIN, PT_MAX],
+        "loss": {"version": 2, "n_hits_min": N_HITS_MIN, "seed_hits_min": SEED_HITS_MIN,
+                 "seed_labels": list(SEED_LABELS), "hit_eff": HIT_EFF,
+                 "hit_eff_default": HIT_EFF_DEFAULT, "eff_weight": EFF_WEIGHT},
     }
 
 def save_checkpoint(x_iters, func_vals, path=None):
@@ -967,11 +1043,22 @@ def run_skopt(space, X, Y, n_calls, n_random, seed, workers):
         )
     return [list(map(float, x)) for x in res.x_iters], [float(y) for y in res.func_vals]
 
-def run_botorch(space, X, Y, n_calls, n_random, seed, batch, workers):
+def run_botorch(space, X, Y, n_calls, n_random, seed, batch, workers, acq="ts"):
     """
     Batch Bayesian optimization with BoTorch: each round fits one GP to all
-    known points and proposes `batch` geometries with q-LogEI, which are then
-    evaluated in parallel (`workers` ROOT jobs at a time).
+    known points and proposes `batch` geometries, which are then evaluated in
+    parallel (`workers` ROOT jobs at a time).
+
+    The GP is fitted to -log(loss): a few very bad geometries (loss >> 1)
+    otherwise dominate the outcome scaling and wash out the differences near
+    the optimum (hold-out rank correlation 0.95 vs 0.60 on real data).
+
+    acq: "ts"     Thompson sampling in a trust region around the best point
+                  (TuRBO, default): one GP posterior draw per batch slot; ~1 s
+                  per batch. Plain global Thompson sampling barely improves in
+                  35 dimensions, the trust region focuses it.
+         "qlogei" q-LogEI optimized point by point; better per point but its
+                  cost grows quickly with batch size and number of points.
     """
     import torch
     from torch.quasirandom import SobolEngine
@@ -980,6 +1067,7 @@ def run_botorch(space, X, Y, n_calls, n_random, seed, batch, workers):
     from botorch.fit import fit_gpytorch_mll
     from botorch.acquisition.logei import qLogExpectedImprovement
     from botorch.optim import optimize_acqf
+    from botorch.generation import MaxPosteriorSampling
     from gpytorch.mlls import ExactMarginalLogLikelihood
 
     torch.set_num_threads(workers)
@@ -992,6 +1080,10 @@ def run_botorch(space, X, Y, n_calls, n_random, seed, batch, workers):
 
     X, Y = list(X), list(Y)
     done, rnd = 0, 0
+    # Trust-region state (TuRBO)
+    tr_len = TR_LENGTH_INIT
+    tr_fail_rounds = max(1, int(np.ceil(max(4.0 / batch, dim / batch))))
+    n_succ = n_fail = 0
     while done < n_calls:
         q = min(batch, n_calls - done)
         t0 = time.time()
@@ -1003,15 +1095,36 @@ def run_botorch(space, X, Y, n_calls, n_random, seed, batch, workers):
             how = "random"
         else:
             train_X = torch.tensor((np.array(X) - lo) / (hi - lo), dtype=dtype)
-            train_Y = -torch.tensor(Y, dtype=dtype).unsqueeze(-1)     # BoTorch maximizes
-            model = SingleTaskGP(train_X, train_Y, train_Yvar=torch.full_like(train_Y, GP_NOISE),
-                                 outcome_transform=Standardize(m=1))
+            # BoTorch maximizes: fit -log(loss), which tames the bad-geometry outliers
+            train_Y = -torch.log(torch.tensor(Y, dtype=dtype)).unsqueeze(-1)
+            # Deterministic objective: tiny noise, relative to the spread (avoids gpytorch's 1e-6 floor)
+            yvar = torch.full_like(train_Y, GP_NOISE_REL * max(train_Y.var().item(), 1e-12))
+            model = SingleTaskGP(train_X, train_Y, train_Yvar=yvar, outcome_transform=Standardize(m=1))
             with threadpool_limits(limits=workers):
                 fit_gpytorch_mll(ExactMarginalLogLikelihood(model.likelihood, model))
-                acq = qLogExpectedImprovement(model, best_f=train_Y.max())
-                cand, _ = optimize_acqf(acq, bounds=unit_bounds, q=q, num_restarts=10,
-                                        raw_samples=512, sequential=True)
-            how = "GP q-LogEI"
+                if acq == "qlogei":
+                    cand, _ = optimize_acqf(qLogExpectedImprovement(model, best_f=train_Y.max()),
+                                            bounds=unit_bounds, q=q, num_restarts=10,
+                                            raw_samples=512, sequential=True)
+                    how = "GP q-LogEI"
+                else:
+                    torch.manual_seed(seed + rnd)
+                    x_best = train_X[train_Y.argmax()]
+                    # Trust region: box around the best point, wider along parameters
+                    # the GP finds less sensitive (longer length scales)
+                    ls = model.covar_module.lengthscale.detach().squeeze()
+                    w = ls / ls.mean()
+                    w = w / torch.prod(w.pow(1.0 / dim))
+                    tr_lb = (x_best - w * tr_len / 2).clamp(0, 1)
+                    tr_ub = (x_best + w * tr_len / 2).clamp(0, 1)
+                    # Candidates: perturb a random subset of the best point's coordinates
+                    pert = tr_lb + (tr_ub - tr_lb) * SobolEngine(dim, scramble=True, seed=seed + rnd).draw(TS_CANDIDATES).to(dtype)
+                    mask = torch.rand(TS_CANDIDATES, dim) <= min(1.0, 20.0 / dim)
+                    mask[torch.arange(TS_CANDIDATES), torch.randint(dim, (TS_CANDIDATES,))] = True
+                    cands = torch.where(mask, pert, x_best.expand(TS_CANDIDATES, dim))
+                    with torch.no_grad():
+                        cand = MaxPosteriorSampling(model=model, replacement=False)(cands, num_samples=q)
+                    how = f"GP Thompson (trust region {tr_len:.3f})"
         t_prop = time.time() - t0
 
         thetas = [list(map(float, lo + np.clip(c, 0.0, 1.0) * (hi - lo))) for c in cand.detach().numpy()]
@@ -1019,10 +1132,25 @@ def run_botorch(space, X, Y, n_calls, n_random, seed, batch, workers):
         ys = evaluate_batch(thetas, workers)
         t_eval = time.time() - t0
 
+        best_before = min(Y) if Y else np.inf
         X += thetas
         Y += [float(y) for y in ys]
         done += len(thetas)
         rnd += 1
+
+        # Trust-region update (only once the GP is driving the search)
+        if how.startswith("GP Thompson"):
+            if min(ys) < best_before - TR_IMPROVEMENT * abs(best_before):
+                n_succ, n_fail = n_succ + 1, 0
+            else:
+                n_succ, n_fail = 0, n_fail + 1
+            if n_succ >= TR_SUCCESS_ROUNDS:
+                tr_len, n_succ = min(2.0 * tr_len, TR_LENGTH_MAX), 0
+            elif n_fail >= tr_fail_rounds:
+                tr_len, n_fail = tr_len / 2.0, 0
+            if tr_len < TR_LENGTH_MIN:
+                print(f"[NOTE] trust region collapsed: restarting it at {TR_LENGTH_INIT}")
+                tr_len = TR_LENGTH_INIT
         save_checkpoint(X, Y)
         print(f"[round {rnd}] {len(thetas)} {how} points: batch best {min(ys):.4f}, "
               f"overall best {min(Y):.4f} ({len(Y)} points) | propose {t_prop:.1f} s, "
@@ -1030,7 +1158,7 @@ def run_botorch(space, X, Y, n_calls, n_random, seed, batch, workers):
     return X, Y
 
 def run_bayes_optimization(n_calls=50, n_initial_points=20, resume=False, seed_files=(),
-                           backend="botorch", batch_size=None, workers=None):
+                           backend="botorch", batch_size=None, workers=None, acq="ts"):
     """
     Run Bayesian optimization to find best layer configuration.
 
@@ -1055,6 +1183,7 @@ def run_bayes_optimization(n_calls=50, n_initial_points=20, resume=False, seed_f
         backend: "botorch" (batches evaluated in parallel) or "skopt" (sequential)
         batch_size: geometries proposed per GP fit (botorch); default = workers
         workers: parallel ROOT jobs and GP threads; default cpu_cap()
+        acq: batch selection for botorch, "ts" (Thompson sampling) or "qlogei"
     """
     workers = workers or cpu_cap()
     batch_size = batch_size or workers
@@ -1066,7 +1195,7 @@ def run_bayes_optimization(n_calls=50, n_initial_points=20, resume=False, seed_f
     print(f"  Total parameters:     {THETA_DIM}")
     print(f"  Optimization calls:   {n_calls}")
     print(f"  Tracks per call:      {N_THETA} theta x {N_PT} pT = {N_THETA * N_PT}")
-    print(f"  Backend:              {backend}" + (f" (batch {batch_size})" if backend == "botorch" else ""))
+    print(f"  Backend:              {backend}" + (f" (batch {batch_size}, {acq})" if backend == "botorch" else ""))
     print(f"  CPU cores used:       {workers} (cap {CPU_FRACTION:.0%} of the node)")
     print(f"{'='*60}\n")
 
@@ -1076,7 +1205,7 @@ def run_bayes_optimization(n_calls=50, n_initial_points=20, resume=False, seed_f
     if backend == "skopt":
         X, Y = run_skopt(space, X, Y, n_calls, n_random, seed, workers)
     elif backend == "botorch":
-        X, Y = run_botorch(space, X, Y, n_calls, n_random, seed, batch_size, workers)
+        X, Y = run_botorch(space, X, Y, n_calls, n_random, seed, batch_size, workers, acq=acq)
     else:
         raise ValueError(f"unknown backend {backend!r}")
 
@@ -1252,14 +1381,31 @@ if __name__ == "__main__":
                         help="botorch: batches of geometries evaluated in parallel (default); "
                              "skopt: one evaluation at a time")
     parser.add_argument("--workers", type=int, default=None,
-                        help=f"parallel ROOT jobs and GP threads (default: {CPU_FRACTION:.0%} "
+                        help=f"parallel ROOT jobs and GP threads (default: {CPU_FRACTION * 100:.0f}%% "
                              f"of the cores = {cpu_cap()})")
+    parser.add_argument("--acq", choices=("ts", "qlogei"), default="ts",
+                        help="botorch batch selection: ts = Thompson sampling (fast, default), "
+                             "qlogei = q-LogEI (slow for large batches)")
     parser.add_argument("--batch", type=int, default=None,
                         help="geometries proposed per GP fit with botorch (default: = workers)")
+    parser.add_argument("--min-hits", type=int, default=N_HITS_MIN,
+                        help=f"track-finding model: minimum measured hits per track (default {N_HITS_MIN})")
+    parser.add_argument("--seed-hits", type=int, default=SEED_HITS_MIN,
+                        help=f"track-finding model: minimum hits in the seed subsystems "
+                             f"{'/'.join(SEED_LABELS)} (default {SEED_HITS_MIN})")
+    parser.add_argument("--hit-eff", type=float, default=None,
+                        help=f"track-finding model: hit efficiency of every layer "
+                             f"(default per subsystem, HIT_EFF in optimizer.py)")
+    parser.add_argument("--eff-weight", type=float, default=EFF_WEIGHT,
+                        help=f"weight of the efficiency term in the loss (default {EFF_WEIGHT}; 0 = resolution only)")
     parser.add_argument("--collider", choices=COLLIDERS, default="MC",
                         help="MC: muon collider with nozzle, no beam pipe layer; "
                              "HC: hadron collider with beam pipe, no nozzle (default: MC)")
     args = parser.parse_args()
+    N_HITS_MIN, SEED_HITS_MIN, EFF_WEIGHT = args.min_hits, args.seed_hits, args.eff_weight
+    if args.hit_eff is not None:
+        HIT_EFF = {k: args.hit_eff for k in HIT_EFF}
+        HIT_EFF_DEFAULT = args.hit_eff
 
     # Initialize configuration: barrel stations (VTX + ITK + OTK) and disks
     initialize_optimization_config(n_stations=args.n_stations, optimize_disks=not args.no_disks,
@@ -1283,4 +1429,4 @@ if __name__ == "__main__":
     # Run Bayesian optimization (evaluates and seeds the baseline itself)
     result = run_bayes_optimization(n_calls=args.n_calls, n_initial_points=args.n_initial,
                                     resume=args.resume, seed_files=args.seed, backend=args.backend,
-                                    batch_size=args.batch, workers=args.workers)
+                                    batch_size=args.batch, workers=args.workers, acq=args.acq)
